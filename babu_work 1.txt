@@ -1,0 +1,73 @@
+import pandas as pd
+import numpy as np
+
+# =========================
+# CONFIGURATION
+# =========================
+header_file = "header.xlsx"
+summary_file = "summary.xlsx"
+
+header_amount_col = "header_amount"     # change if needed
+summary_amount_col = "line_amount"      # change if needed
+
+tolerance = 0.10   # acceptable difference (you can tune this)
+
+# =========================
+# STEP 1: READ FILES
+# =========================
+df_header = pd.read_excel(header_file)
+df_summary = pd.read_excel(summary_file)
+
+# =========================
+# STEP 2: FILTER DATA
+# =========================
+df_header = df_header[df_header["duplicate_flag"] == 0]
+df_summary = df_summary[df_summary["match"] == True]
+
+# =========================
+# STEP 3: JOIN (ADD unique_key TO SUMMARY)
+# =========================
+df_joined = pd.merge(
+    df_summary,
+    df_header[["key_file", "unique_key", header_amount_col]],
+    on="key_file",
+    how="left"
+)
+
+# =========================
+# STEP 4: AGGREGATE SUMMARY AMOUNT
+# =========================
+df_agg = (
+    df_joined
+    .groupby(["key_file", "unique_key", header_amount_col], as_index=False)
+    [summary_amount_col]
+    .sum()
+    .rename(columns={summary_amount_col: "summary_total"})
+)
+
+# =========================
+# STEP 5: COMPARE AMOUNTS (WITH TOLERANCE)
+# =========================
+df_agg["difference"] = np.abs(df_agg[header_amount_col] - df_agg["summary_total"])
+
+df_agg["status"] = np.where(
+    df_agg["difference"] <= tolerance,
+    "MATCH",
+    "MISMATCH"
+)
+
+# =========================
+# STEP 6: GET MISMATCH RECORDS
+# =========================
+df_mismatch = df_agg[df_agg["status"] == "MISMATCH"]
+
+# =========================
+# STEP 7: OUTPUT
+# =========================
+print("Mismatch Records:")
+print(df_mismatch[["key_file", "unique_key", header_amount_col, "summary_total", "difference"]])
+
+# Optional: Save to Excel
+df_mismatch.to_excel("mismatch_output.xlsx", index=False)
+
+print("DQ check completed.")
