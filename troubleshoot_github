@@ -1,0 +1,2 @@
+curl -H "Authorization: token github_pat_11AQAT54Q0s..." \
+  https://api.github.com/repos/GPODevelopment/Data_Engg_Data_Science_Pre_Prod
