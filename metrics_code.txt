@@ -1,0 +1,233 @@
+import ast
+import os
+import json
+from langchain_community.chat_models import ChatOllama
+
+# =========================
+# CONFIG
+# =========================
+PROJECT_PATH = "your_project_root_path"
+EXCLUDE_FOLDERS = {'.venv', 'venv', '__pycache__', '.git'}
+MODEL_NAME = "llama3.1:8b"
+
+# =========================
+# LLM SETUP
+# =========================
+llm = ChatOllama(model=MODEL_NAME)
+
+
+def call_llm(prompt):
+    response = llm.invoke(prompt)
+    return response.content
+
+
+def clean_response(response):
+    response = response.strip()
+    if response.startswith("```"):
+        response = response.replace("```json", "").replace("```", "").strip()
+    return response
+
+
+# =========================
+# PROMPTS
+# =========================
+def get_function_prompt(func_name, func_code):
+    return f"""
+You are a senior data engineer.
+
+Explain the purpose of this Python function in simple Indian English.
+
+Return JSON:
+{{
+  "function_name": "{func_name}",
+  "purpose": "short explanation"
+}}
+
+Do not add extra text.
+
+Function Code:
+{func_code}
+"""
+
+
+def get_package_prompt(package_usage_json):
+    return f"""
+You are a senior data engineer.
+
+Explain how each package is used in the code.
+
+Input:
+{package_usage_json}
+
+Return JSON:
+{{
+  "package_name": "purpose"
+}}
+
+Keep explanation short.
+"""
+
+
+# =========================
+# AST HELPERS
+# =========================
+def get_import_aliases(tree):
+    alias_map = {}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for n in node.names:
+                alias_map[n.asname or n.name] = n.name
+
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module
+            for n in node.names:
+                alias_map[n.asname or n.name] = module
+
+    return alias_map
+
+
+def get_package_usage(tree, alias_map):
+    usage = {}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute):
+                obj = node.func.value
+                if isinstance(obj, ast.Name):
+                    alias = obj.id
+                    func_name = node.func.attr
+
+                    if alias in alias_map:
+                        package = alias_map[alias]
+
+                        if package not in usage:
+                            usage[package] = []
+
+                        usage[package].append(func_name)
+
+    # remove duplicates
+    for k in usage:
+        usage[k] = list(set(usage[k]))
+
+    return usage
+
+
+def get_function_code(source_code, node):
+    lines = source_code.splitlines()
+    return "\n".join(lines[node.lineno - 1: node.end_lineno])
+
+
+def get_function_calls(node):
+    calls = []
+
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call):
+            if isinstance(child.func, ast.Attribute):
+                calls.append(child.func.attr)
+            elif isinstance(child.func, ast.Name):
+                calls.append(child.func.id)
+
+    return list(set(calls))
+
+
+# =========================
+# FILE ANALYSIS
+# =========================
+def analyze_file(file_path):
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            code = f.read()
+
+        tree = ast.parse(code)
+
+        alias_map = get_import_aliases(tree)
+        package_usage = get_package_usage(tree, alias_map)
+
+        file_result = {
+            "file_name": os.path.basename(file_path),
+            "file_path": file_path,
+            "lines_of_code": len(code.splitlines()),
+            "package_usage": package_usage,
+            "functions": []
+        }
+
+        # 🔹 Function Analysis
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                func_name = node.name
+                loc = node.end_lineno - node.lineno + 1
+
+                func_code = get_function_code(code, node)
+                func_calls = get_function_calls(node)
+
+                # LLM for function purpose
+                prompt = get_function_prompt(func_name, func_code)
+                response = call_llm(prompt)
+                cleaned = clean_response(response)
+
+                try:
+                    purpose_json = json.loads(cleaned)
+                    purpose = purpose_json.get("purpose", "")
+                except:
+                    purpose = cleaned
+
+                file_result["functions"].append({
+                    "function_name": func_name,
+                    "loc": loc,
+                    "calls": func_calls,
+                    "purpose": purpose
+                })
+
+        # 🔹 Package Purpose (LLM)
+        if package_usage:
+            prompt = get_package_prompt(json.dumps(package_usage, indent=2))
+            response = call_llm(prompt)
+            cleaned = clean_response(response)
+
+            try:
+                package_purpose = json.loads(cleaned)
+            except:
+                package_purpose = {}
+
+            file_result["package_purpose"] = package_purpose
+
+        return file_result
+
+    except Exception as e:
+        print(f"Error processing {file_path}: {e}")
+        return None
+
+
+# =========================
+# PROJECT SCAN
+# =========================
+def scan_project(project_path):
+    results = []
+
+    for root, dirs, files in os.walk(project_path):
+        dirs[:] = [d for d in dirs if d not in EXCLUDE_FOLDERS]
+
+        for file in files:
+            if file.endswith(".py"):
+                file_path = os.path.join(root, file)
+
+                print(f"Processing: {file_path}")
+
+                result = analyze_file(file_path)
+                if result:
+                    results.append(result)
+
+    return results
+
+
+# =========================
+# RUN
+# =========================
+if __name__ == "__main__":
+    output = scan_project(PROJECT_PATH)
+
+    with open("final_code_analysis.json", "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2)
+
+    print("✅ Analysis completed. Output saved.")
