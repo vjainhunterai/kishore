@@ -97,3 +97,41 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+===
+
+
+Connecting to prod-db.c969yoyq9cyy.us-east-1.rds.amazonaws.com:3306/contracts ...
+Executing query (streaming) ...
+c:\program files\python37\lib\site-packages\pymysql\connections.py:803: UserWarning: Previous unbuffered result was left incomplete
+  warnings.warn("Previous unbuffered result was left incomplete")
+---------------------------------------------------------------------------
+TypeError                                 Traceback (most recent call last)
+~\AppData\Local\Temp\2\ipykernel_8336\1508200747.py in <module>
+     97 
+     98 if __name__ == "__main__":
+---> 99     main()
+
+~\AppData\Local\Temp\2\ipykernel_8336\1508200747.py in main()
+     81 
+     82             for row in chunk:
+---> 83                 ws.append(row)
+     84             total_rows += len(chunk)
+     85             print(f"  ... {total_rows:,} rows written ({time.time()-t0:.1f}s)")
+
+~\AppData\Roaming\Python\Python37\site-packages\openpyxl\worksheet\_write_only.py in append(self, row)
+    110             not isinstance(row, (list, tuple, range))
+    111             ):
+--> 112             self._invalid_row(row)
+    113 
+    114         self._get_writer()
+
+~\AppData\Roaming\Python\Python37\site-packages\openpyxl\worksheet\_write_only.py in _invalid_row(self, iterable)
+    157     def _invalid_row(self, iterable):
+    158         raise TypeError('Value must be a list, tuple, range or a generator Supplied value is {0}'.format(
+--> 159             type(iterable))
+    160                         )
+
+TypeError: Value must be a list, tuple, range or a generator Supplied value is <class 'sqlalchemy.engine.row.LegacyRow'>
+
