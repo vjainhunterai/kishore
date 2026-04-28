@@ -1,119 +1,99 @@
 """
-MySQL RDS → Excel Exporter
-Hardcoded SQL + connection config. Just edit and run.
+MySQL RDS → Excel Exporter (optimized for large datasets)
 """
-
 import pandas as pd
 from sqlalchemy import create_engine, text
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from datetime import datetime
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, NamedStyle
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
+import time
 
 # ============================================================
-# CONFIGURATION — Edit these values
+# CONFIGURATION
 # ============================================================
-
-DB_HOST = "prod-db.asnbcjdhjkhjkhjkhkjhjkjkjkjkjk.us-east-1.rds.amazonaws.com"
+DB_HOST = "prod-db.xxxxx.us-east-1.rds.amazonaws.com"
 DB_PORT = 3306
 DB_NAME = "contracts"
-DB_USER = ""
-DB_PASS = "!#!"
-SSL_CA = None  # e.g. "/path/to/rds-combined-ca-bundle.pem"
+DB_USER = "user"
+DB_PASS = "pass"
+SSL_CA = None
 
 OUTPUT_FILE = "inmar_2021_data_v1.xlsx"
 SHEET_NAME = "QueryResult"
-
-# ============================================================
-# SQL STATEMENT — Put your query here
-# ============================================================
+CHUNK_SIZE = 50_000  # rows fetched per round-trip
 
 SQL = """
-
 SELECT * FROM l1_t0004_db.temp_ap_inv
-where year(CREATED_ON) < 2022;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    
-          
-
+WHERE CREATED_ON < '2022-01-01'
 """
 
 # ============================================================
-# EXPORT LOGIC — No need to edit below
-# ============================================================
-
 def main():
-    url = f"mysql+pymysql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    t0 = time.time()
+    
+    url = (
+        f"mysql+pymysql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+        f"?charset=utf8mb4"
+    )
     connect_args = {}
     if SSL_CA:
         connect_args["ssl"] = {"ca": SSL_CA}
 
-    engine = create_engine(url, connect_args=connect_args)
+    # stream_results=True + server-side cursor avoids loading all rows in memory
+    engine = create_engine(
+        url,
+        connect_args=connect_args,
+        pool_pre_ping=True,
+    )
 
     print(f"Connecting to {DB_HOST}:{DB_PORT}/{DB_NAME} ...")
-    with engine.connect() as conn:
-        print("Executing query ...")
-        df = pd.read_sql(text(SQL), conn)
 
-    row_count = len(df)
-    col_count = len(df.columns)
-    print(f"Fetched {row_count} rows × {col_count} columns")
+    # write_only mode: dramatically faster, low memory, append rows as tuples
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet(SHEET_NAME)
 
-    if row_count == 0:
-        print("WARNING: Query returned 0 rows. Creating file with headers only.")
+    header_font = Font(bold=True, color="FFFFFF", name="Arial", size=11)
+    header_fill = PatternFill("solid", fgColor="4472C4")
+    header_align = Alignment(horizontal="center", vertical="center")
 
-    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=SHEET_NAME)
-        ws = writer.sheets[SHEET_NAME]
+    headers_written = False
+    total_rows = 0
+    columns = []
 
-        header_font = Font(bold=True, color="FFFFFF", name="Arial", size=11)
-        header_fill = PatternFill("solid", fgColor="4472C4")
-        header_align = Alignment(horizontal="center", vertical="center")
-        thin_border = Border(bottom=Side(style="thin", color="B4C6E7"))
+    with engine.connect().execution_options(stream_results=True, max_row_buffer=CHUNK_SIZE) as conn:
+        print("Executing query (streaming) ...")
+        result = conn.execution_options(yield_per=CHUNK_SIZE).execute(text(SQL))
 
-        for col_idx, col_name in enumerate(df.columns, 1):
-            cell = ws.cell(row=1, column=col_idx)
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = header_align
+        for chunk in result.partitions(CHUNK_SIZE):
+            if not headers_written:
+                columns = list(result.keys())
+                from openpyxl.cell import WriteOnlyCell
+                header_cells = []
+                for col_name in columns:
+                    c = WriteOnlyCell(ws, value=col_name)
+                    c.font = header_font
+                    c.fill = header_fill
+                    c.alignment = header_align
+                    header_cells.append(c)
+                ws.append(header_cells)
+                headers_written = True
 
-        for col_idx, col_name in enumerate(df.columns, 1):
-            max_len = max(
-                len(str(col_name)),
-                df[col_name].astype(str).str.len().max() if row_count > 0 else 0,
-            )
-            ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 4, 50)
+            for row in chunk:
+                ws.append(row)
+            total_rows += len(chunk)
+            print(f"  ... {total_rows:,} rows written ({time.time()-t0:.1f}s)")
 
-        stripe_fill = PatternFill("solid", fgColor="D9E2F3")
-        data_font = Font(name="Arial", size=10)
-        for row_idx in range(2, row_count + 2):
-            for col_idx in range(1, col_count + 1):
-                cell = ws.cell(row=row_idx, column=col_idx)
-                cell.font = data_font
-                cell.border = thin_border
-                if row_idx % 2 == 0:
-                    cell.fill = stripe_fill
+    # column widths — set once, no per-cell work
+    for idx, col_name in enumerate(columns, 1):
+        ws.column_dimensions[get_column_letter(idx)].width = min(max(len(str(col_name)) + 4, 14), 50)
 
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
+    ws.freeze_panes = "A2"
 
-    print(f"Exported to: {OUTPUT_FILE}")
+    print(f"Saving workbook ({total_rows:,} rows) ...")
+    wb.save(OUTPUT_FILE)
+    print(f"Done in {time.time()-t0:.1f}s → {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
     main()
-
-
