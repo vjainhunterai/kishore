@@ -1,0 +1,14 @@
+CREATE TABLE `AdminFeeAnalysisTasks` (
+  `ID` binary(16) NOT NULL DEFAULT UUID_TO_BIN(UUID(), 1),
+  `customer_id` varchar(10) COLLATE utf8mb4_unicode_ci NOT NULL,  
+  `task_param` text COLLATE utf8mb4_unicode_ci NOT NULL,
+  `input_file_path` text COLLATE utf8mb4_unicode_ci NOT NULL,
+  `output_file_path` text COLLATE utf8mb4_unicode_ci NOT NULL,  
+  `airflow_dag_id` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `airflow_dag_run_id` varchar(100) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `airflow_dag_start_date` datetime DEFAULT NULL,
+  `airflow_dag_end_date` datetime DEFAULT NULL,
+  `createdBy` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `createdOn` datetime NOT NULL,
+  PRIMARY KEY (`ID`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
