@@ -41,3 +41,84 @@ SELECT CONCAT(
 FROM information_schema.tables
 WHERE table_schema = 'your_schema_name'   -- replace this
   AND table_type = 'BASE TABLE';
+
+
+
+==========================
+
+
+SELECT 
+    table_schema                                                    AS 'Schema',
+    COUNT(*)                                                        AS 'Table Count',
+    SUM(table_rows)                                                 AS 'Estimated Rows',
+    ROUND(SUM(data_length) / 1024 / 1024, 2)                      AS 'Data Size (MB)',
+    ROUND(SUM(index_length) / 1024 / 1024, 2)                     AS 'Index Size (MB)',
+    ROUND(SUM(data_free) / 1024 / 1024, 2)                        AS 'Free Space (MB)',
+    ROUND(SUM(data_length + index_length) / 1024 / 1024, 2)       AS 'Total Size (MB)',
+    ROUND(SUM(data_length + index_length) / 1024 / 1024 / 1024, 4) AS 'Total Size (GB)'
+FROM information_schema.tables
+WHERE table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+  AND table_type = 'BASE TABLE'
+GROUP BY table_schema
+ORDER BY SUM(data_length + index_length) DESC;
+
+
+
+SELECT 
+    table_schema                                                  AS 'Schema',
+    table_name                                                    AS 'Table',
+    table_rows                                                    AS 'Estimated Rows',
+    ROUND(data_length / 1024 / 1024, 2)                          AS 'Data (MB)',
+    ROUND(index_length / 1024 / 1024, 2)                         AS 'Index (MB)',
+    ROUND((data_length + index_length) / 1024 / 1024, 2)         AS 'Total Size (MB)',
+    engine                                                        AS 'Engine',
+    row_format                                                    AS 'Row Format'
+FROM information_schema.tables
+WHERE table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+  AND table_type = 'BASE TABLE'
+ORDER BY table_schema, (data_length + index_length) DESC;
+
+
+
+SELECT 
+    table_schema                                                        AS 'Schema',
+    COUNT(*)                                                            AS 'Tables',
+    FORMAT(SUM(table_rows), 0)                                          AS 'Est. Rows',
+    CONCAT(ROUND(SUM(data_length)                / 1024 / 1024, 2), ' MB')  AS 'Data Size',
+    CONCAT(ROUND(SUM(index_length)               / 1024 / 1024, 2), ' MB')  AS 'Index Size',
+    CONCAT(ROUND(SUM(data_free)                  / 1024 / 1024, 2), ' MB')  AS 'Free Space',
+    CONCAT(ROUND(SUM(data_length + index_length) / 1024 / 1024, 2), ' MB')  AS 'Total (MB)',
+    CONCAT(ROUND(SUM(data_length + index_length) / 1024 / 1024 / 1024, 3), ' GB') AS 'Total (GB)'
+FROM information_schema.tables
+WHERE table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+  AND table_type = 'BASE TABLE'
+GROUP BY table_schema
+ORDER BY SUM(data_length + index_length) DESC;
+
+
+
+SELECT 
+    table_schema                                              AS 'Schema',
+    table_name                                               AS 'Table',
+    FORMAT(table_rows, 0)                                    AS 'Est. Rows',
+    ROUND((data_length + index_length) / 1024 / 1024, 2)    AS 'Total Size (MB)',
+    ROUND(data_length / 1024 / 1024, 2)                     AS 'Data (MB)',
+    ROUND(index_length / 1024 / 1024, 2)                    AS 'Index (MB)',
+    ROUND(data_free / 1024 / 1024, 2)                       AS 'Fragmented (MB)'
+FROM information_schema.tables
+WHERE table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+  AND table_type = 'BASE TABLE'
+ORDER BY (data_length + index_length) DESC
+LIMIT 10;
+
+
+
+SELECT 
+    ROUND(SUM(data_length + index_length) / 1024 / 1024, 2)        AS 'Total Used (MB)',
+    ROUND(SUM(data_length + index_length) / 1024 / 1024 / 1024, 3) AS 'Total Used (GB)',
+    ROUND(SUM(data_free) / 1024 / 1024, 2)                         AS 'Total Fragmented (MB)'
+FROM information_schema.tables
+WHERE table_type = 'BASE TABLE';
+
+
+
