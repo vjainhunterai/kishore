@@ -1,0 +1,419 @@
+ctxkey,ctxval
+5,"create table {SCHEMA}.PO_Data_{table_name}_v1  as 
+SELECT a.*, 'data_2023_file.txt'  as file_name FROM {SCHEMA}.PO_Data_v1  a
+where Contract_Number = '{CONTRACT_NAME}'  ;"
+6,"INSERT INTO {SCHEMA}.PO_Data_{table_name}_v1
+ SELECT 
+     PO_seq_no AS `PO_seq_no`,
+     Purchase_Order_Date AS `Transaction_Date`,
+     Purchase_Order AS `Transaction_Number`,
+     PO_Line AS `Transaction_Line_Number`,
+     NULL AS `Direct_Parent_Entity_Code`,
+     Company AS `Facility_Name`,
+     NULL AS `Facility_Department_Number`,
+     NULL AS `Facility_Department_Name`,
+     NULL AS `Facility_MMIS`,
+     NULL AS `Contract_Category`,
+     Manufacturer AS `Manufacturer_Name`,
+     Mfr_Part_ID AS `Manufacturer_Catalog_Number`,
+     Line_Item_Description AS `Product_Description`,
+     Supplier AS `Vendor_Name`,
+     NULL AS `Facility_Vendor_Catalog_Num`,
+     NULL AS `Facility_Manufacturer_Name`,
+     NULL AS `Facility_Manufacturer_Catalog_Num`,
+     NULL AS `Facility_Product_Description`,
+     NULL AS `Facility_Base_Price`,
+     NULL AS `Facility_Pkg_UOM`,
+     NULL AS `Facility_UOM_Conv`,
+     NULL AS `Base_Each_Price`,
+     NULL AS `Manufacturer_Top_Parent_Name`,
+     contract_number AS `Contract_Number`,
+     NULL AS `Contract_Name`,
+     NULL AS `Contracted_Supplier`,
+     NULL AS `Contract_Pkg_UOM`,
+     NULL AS `Contract_UOM_Conv`,
+     PO_Line_Item_Tags AS `Spend_Type`,
+     NULL AS `Signed_Tier_Description`,
+     NULL AS `Packaging_String`,
+     Unit_of_Measure AS `Pkg_UOM`,
+     NULL AS `UOM_Conv`,
+     Commodity_Code AS `UNSPSC_Class_Code`,
+     NULL AS `UNSPSC_Class_Description`,
+     NULL AS `UNSPSC_Commodity_Code`,
+     NULL AS `UNSPSC_Commodity_Description`,
+     NULL AS `UNSPSC_Family_Code`,
+     NULL AS `UNSPSC_Family_Description`,
+     NULL AS `UNSPSC_Segment_Code`,
+     NULL AS `UNSPSC_Segment_Description`,
+     NULL AS `Benchmark_Low_Price__Recent_12_Months`,
+     NULL AS `Benchmark_10th_Percentile__Recent_12_Months`,
+     NULL AS `Benchmark_25th_Percentile__Recent_12_Months`,
+     NULL AS `Benchmark_Median_Price__Recent_12_Months`,
+     NULL AS `Benchmark_High_Price__Recent_12_Months`,
+     NULL AS `Last_Transaction_Date`,
+     Quantity_Ordered AS `Quantity`,
+     NULL AS `Quantity__in_Eaches`,
+     Extended_Amount AS `Base_Spend`,
+     Unit_Cost AS `Last_Base_Price`,
+     NULL AS `Last_Base_Each_Price`,
+     NULL AS `VENDOR_NAME_ALIAS`,
+     NULL AS `rnk1`,
+     NULL AS `PO_Key_columns`,
+     file_name AS file_name
+ FROM {SCHEMA}.Purchase_Order_Details
+ WHERE Mfr_Part_ID IN (
+     SELECT DISTINCT Manufacturer_Catalog_Number
+     FROM {SCHEMA}.PO_Data_{table_name}_v1
+ ) ;"
+9,"CREATE TABLE {SCHEMA}.AP_Data_v4_dedup_{table_name}_v1 AS
+SELECT a.*
+FROM {SCHEMA}.AP_Data_v4 a
+INNER JOIN (
+    SELECT *
+    FROM l3_dm_db.dim_vendor
+    WHERE VENDOR_NAME_ALIAS IN (
+        SELECT DISTINCT VENDOR_NAME_ALIAS
+        FROM l3_dm_db.dim_vendor
+        WHERE Vendor_Name IN (
+            SELECT DISTINCT Vendor_Name
+            FROM (
+                SELECT DISTINCT Vendor_Name AS Vendor_Name
+                FROM admin_fee.PO_Data_v1
+                WHERE Contract_Number = '{CONTRACT_NAME}'
+
+                UNION ALL
+
+                SELECT DISTINCT Manufacturer_Name AS Vendor_Name
+                FROM admin_fee.PO_Data_v1
+                WHERE Contract_Number = '{CONTRACT_NAME}'
+
+                UNION ALL
+
+                SELECT DISTINCT Contracted_Supplier AS Vendor_Name
+                FROM admin_fee.PO_Data_v1
+                WHERE Contract_Number = '{CONTRACT_NAME}'
+            ) a
+            WHERE Vendor_Name <> 'UNKNOWN'
+        )
+    )
+) b
+ON a.Supplier = b.VENDOR_NAME;
+"
+10,"create table {SCHEMA}.AP_Data_{table_name}_v1  as  
+select * from (
+select distinct b.*
+ FROM 
+ ( select * from {SCHEMA}.PO_Data_{table_name}_v1 ) a
+ left join 
+{SCHEMA}.AP_Data_v4_dedup_{table_name}_v1   b
+ on  trim(coalesce(a.Facility_Product_Description, a.Product_Description)) = 
+ trim(LEFT(b.Line_Description, LENGTH(coalesce(a.Facility_Product_Description, a.Product_Description))))
+
+ ) b ;"
+11,"CREATE TABLE {SCHEMA}.`PO_Master_{table_name}_v1` (
+  `PO_Master_seq_no` int NOT NULL AUTO_INCREMENT,
+  `PO_seq_no` int NOT NULL DEFAULT '0',
+  `INV_seq_no` int DEFAULT NULL,
+  `PO_Number_common` varchar(255) DEFAULT NULL,
+  `PO_Number` varchar(255) DEFAULT NULL,
+  `INV_PO_Number` varchar(255) DEFAULT NULL,
+  `PO_Date` varchar(250) DEFAULT NULL,
+  `INV_Date` varchar(10) DEFAULT NULL,
+  `Suppliers_Invoice_Number` varchar(255) DEFAULT NULL,
+  `PO_Vendor_Name` varchar(255) DEFAULT NULL,
+  `INV_Vendor_Name` varchar(255) DEFAULT NULL,
+  `PO_Line` varchar(255) DEFAULT NULL,
+  `INV_PO_Line` binary(0) DEFAULT NULL,
+  `PO_Description` varchar(255) DEFAULT NULL,
+  `INV_Description` text,
+  `MRN` varchar(255) DEFAULT NULL,
+  `Facility_Product_Description` varchar(500) DEFAULT NULL,
+  `Contract_Number` varchar(100) DEFAULT NULL,
+  `Contract_Name` varchar(255) DEFAULT NULL,
+  `Contracted_Supplier` varchar(255) DEFAULT NULL,
+  `PO_Quantity` varchar(100) DEFAULT NULL,
+  `INV_Quantity` varchar(255) DEFAULT NULL,
+  `PO_Base_Spend` varchar(100) DEFAULT NULL,
+  `INV_Extended_Spend` varchar(255) DEFAULT NULL,
+  `PO_Base_Price` varchar(100) DEFAULT NULL,
+  `INV_Base_Price` varchar(255) DEFAULT NULL,
+  `PO_Base_Spend_actual` varchar(100) DEFAULT NULL,
+  `INV_Extended_Spend_actual` varchar(255) DEFAULT NULL,
+  `Matched_Flag` varchar(255) NOT NULL DEFAULT '',
+  PRIMARY KEY (`PO_Master_seq_no`)
+) ENGINE=InnoDB AUTO_INCREMENT=4318 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci ;"
+12,"insert into  {SCHEMA}.`PO_Master_{table_name}_v1`
+(
+
+`PO_seq_no` , `INV_seq_no` , `PO_Number_common` , `PO_Number` , `INV_PO_Number` , 
+`PO_Date` , `INV_Date` , `Suppliers_Invoice_Number` , `PO_Vendor_Name` , 
+`INV_Vendor_Name` , `PO_Line` , `INV_PO_Line` , `PO_Description` ,
+ `INV_Description` , `MRN` , `Facility_Product_Description` , `Contract_Number` , 
+ `Contract_Name` , `Contracted_Supplier` , `PO_Quantity` , `INV_Quantity` , `PO_Base_Spend` , 
+ `INV_Extended_Spend` , `PO_Base_Price` , `INV_Base_Price` , `PO_Base_Spend_actual` ,
+ `INV_Extended_Spend_actual`   ,Matched_Flag
+
+)
+select 
+`PO_seq_no` , `INV_seq_no` , `PO_Number_common` , `PO_Number` , `INV_PO_Number` , 
+`PO_Date` , `INV_Date` , `Suppliers_Invoice_Number` , `PO_Vendor_Name` , 
+`INV_Vendor_Name` , `PO_Line` , `INV_PO_Line` , `PO_Description` ,
+ `INV_Description` , `MRN` , `Facility_Product_Description` , `Contract_Number` , 
+ `Contract_Name` , `Contracted_Supplier` , `PO_Quantity` , `INV_Quantity` , `PO_Base_Spend` , 
+ `INV_Extended_Spend` , `PO_Base_Price` , `INV_Base_Price` , `PO_Base_Spend_actual` ,
+ `INV_Extended_Spend_actual`   ,Matched_Flag
+
+ from ( select  
+`PO_seq_no` , `INV_seq_no` , `PO_Number_common` , `PO_Number` , `INV_PO_Number` , 
+`PO_Date` , `INV_Date` , `Suppliers_Invoice_Number` , `PO_Vendor_Name` , 
+`INV_Vendor_Name` , `PO_Line` , `INV_PO_Line` , `PO_Description` ,
+ `INV_Description` , `MRN` , `Facility_Product_Description` , `Contract_Number` , 
+ `Contract_Name` , `Contracted_Supplier` , `PO_Quantity` , `INV_Quantity` , `PO_Base_Spend` , 
+ `INV_Extended_Spend` , `PO_Base_Price` , `INV_Base_Price` , `PO_Base_Spend_actual` ,
+ `INV_Extended_Spend_actual`   ,Matched_Flag
+
+ from  (SELECT   PO_seq_no  as PO_seq_no,  b.seq_no 
+ as INV_seq_no,  coalesce(Transaction_Number , b.External_PO_Number)         
+ as PO_Number_common, Transaction_Number  as PO_Number , 
+coalesce(b.External_PO_Number,b.Purchase_Orders)  as INV_PO_Number , Transaction_Date  as PO_Date, b.Invoice_Date  as INV_Date , 
+ b.Suppliers_Invoice_Number  as Suppliers_Invoice_Number, a.Vendor_Name 
+ as `PO_Vendor_Name` , b.Supplier  as `INV_Vendor_Name` , Transaction_Line_Number  
+ as PO_Line, null  as INV_PO_Line , Product_Description   as  PO_Description, 
+ b.Line_Description                   as INV_Description, a.Manufacturer_Catalog_Number  
+ as MRN, Facility_Product_Description   as Facility_Product_Description, a.Contract_Number 
+ as Contract_Number, a.Contract_Name  as Contract_Name, a.Contracted_Supplier  
+ as Contracted_Supplier, a.Quantity  as PO_Quantity , b.Quantity 
+ as INV_Quantity , Base_Spend  as PO_Base_Spend , CASE 
+    WHEN b.Invoice_Amount  < 0 THEN -ABS(b.Extended_Amount)
+    ELSE b.Extended_Amount
+END 
+ as INV_Extended_Spend , a.Last_Base_Price  
+ as PO_Base_Price, b.Unit_Cost  as INV_Base_Price, 
+ case when  ( row_number () over ( partition by PO_seq_no)) = 1 then   
+ Base_Spend else 0 end  as PO_Base_Spend_actual , 
+CASE 
+    WHEN (row_number() OVER (PARTITION BY b.seq_no)) = 1 THEN
+        CASE 
+            WHEN b.Invoice_Amount < 0 THEN -ABS(b.Extended_Amount)
+            ELSE b.Extended_Amount
+        END
+    ELSE 0
+END   as INV_Extended_Spend_actual ,
+  'Desc_PO_No_Amount'   as  Matched_Flag
+ FROM   ( select * from {SCHEMA}.PO_Data_{table_name}_v1 ) a  
+ left join  {SCHEMA}.AP_Data_{table_name}_v1 b     
+ on  
+trim(coalesce(a.Facility_Product_Description, a.Product_Description)) =  
+ trim(LEFT(b.Line_Description, LENGTH(coalesce(a.Facility_Product_Description, 
+ a.Product_Description))))
+ and a.Transaction_Number  = coalesce(b.External_PO_Number,b.Purchase_Orders)
+ ) a   )a 
+ 
+ 
+ where   
+ PO_Base_Spend= INV_Extended_Spend"
+13,"insert into {SCHEMA}.`PO_Master_{table_name}_v1`
+(
+`PO_seq_no`	,
+`INV_seq_no`	,
+`PO_Number_common`	,
+`PO_Number`	,
+`INV_PO_Number`	,
+`PO_Date`	,
+`INV_Date`	,
+`Suppliers_Invoice_Number`	,
+`PO_Vendor_Name`	,
+`INV_Vendor_Name`	,
+`PO_Line`	,
+`INV_PO_Line`	,
+`PO_Description`	,
+`INV_Description`	,
+`MRN`	,
+`Facility_Product_Description`	,
+`Contract_Number`	,
+`Contract_Name`	,
+`Contracted_Supplier`	,
+`PO_Quantity`	,
+`INV_Quantity`	,
+`PO_Base_Spend`	,
+`INV_Extended_Spend`	,
+`PO_Base_Price`	,
+`INV_Base_Price`	,
+PO_Base_Spend_actual ,
+INV_Extended_Spend_actual ,
+Matched_Flag	
+)
+select 
+`PO_seq_no`	,
+`INV_seq_no`	,
+`PO_Number_common`	,
+`PO_Number`	,
+`INV_PO_Number`	,
+`PO_Date`	,
+`INV_Date`	,
+`Suppliers_Invoice_Number`	,
+`PO_Vendor_Name`	,
+`INV_Vendor_Name`	,
+`PO_Line`	,
+`INV_PO_Line`	,
+`PO_Description`	,
+`INV_Description`	,
+`MRN`	,
+`Facility_Product_Description`	,
+`Contract_Number`	,
+`Contract_Name`	,
+`Contracted_Supplier`	,
+`PO_Quantity`	,
+`INV_Quantity`	,
+`PO_Base_Spend`	,
+`INV_Extended_Spend`	,
+`PO_Base_Price`	,
+`INV_Base_Price`	,
+PO_Base_Spend_actual ,
+INV_Extended_Spend_actual ,
+Matched_Flag
+
+ from 
+(SELECT 
+null  as PO_seq_no, 
+b.seq_no  as INV_seq_no, 
+b.External_PO_Number          as PO_Number_common,
+null  as PO_Number ,
+coalesce(b.External_PO_Number,b.Purchase_Orders)  as INV_PO_Number ,
+null  as PO_Date,
+b.Invoice_Date  as INV_Date ,
+b.Suppliers_Invoice_Number  as Suppliers_Invoice_Number,
+null as `PO_Vendor_Name`	,
+b.Supplier  as `INV_Vendor_Name`	,
+null as PO_Line,
+null  as INV_PO_Line ,
+null   as  PO_Description,
+b.Line_Description                   as INV_Description,
+null  as MRN,
+null  as Facility_Product_Description,
+null  as Contract_Number,
+null  as Contract_Name,
+null  as Contracted_Supplier,
+null  as PO_Quantity ,
+b.Quantity as INV_Quantity ,
+null as PO_Base_Spend ,
+CASE 
+    WHEN  b.Invoice_Amount  < 0 THEN -ABS(b.Extended_Amount)
+    ELSE b.Extended_Amount
+END   as INV_Extended_Spend ,
+null  as PO_Base_Price,
+b.Unit_Cost  as INV_Base_Price,
+0  as  PO_Base_Spend_actual ,
+CASE 
+    WHEN  b.Invoice_Amount  < 0 THEN -ABS(b.Extended_Amount)
+    ELSE b.Extended_Amount
+END  as INV_Extended_Spend_actual ,
+'No_Line_Level_Match_PO_Side'   as  Matched_Flag
+from {SCHEMA}.AP_Data_{table_name}_v1 b
+where seq_no  not in (SELECT distinct INV_seq_no FROM {SCHEMA}.`PO_Master_{table_name}_v1`  
+where INV_seq_no is not null)) a"
+14,"insert into {SCHEMA}.`PO_Master_{table_name}_v1`
+(
+`PO_seq_no`	,
+`INV_seq_no`	,
+`PO_Number_common`	,
+`PO_Number`	,
+`INV_PO_Number`	,
+`PO_Date`	,
+`INV_Date`	,
+`Suppliers_Invoice_Number`	,
+`PO_Vendor_Name`	,
+`INV_Vendor_Name`	,
+`PO_Line`	,
+`INV_PO_Line`	,
+`PO_Description`	,
+`INV_Description`	,
+`MRN`	,
+`Facility_Product_Description`	,
+`Contract_Number`	,
+`Contract_Name`	,
+`Contracted_Supplier`	,
+`PO_Quantity`	,
+`INV_Quantity`	,
+`PO_Base_Spend`	,
+`INV_Extended_Spend`	,
+`PO_Base_Price`	,
+`INV_Base_Price`	,
+PO_Base_Spend_actual ,
+INV_Extended_Spend_actual ,
+Matched_Flag	
+)
+select 
+`PO_seq_no`	,
+`INV_seq_no`	,
+`PO_Number_common`	,
+`PO_Number`	,
+`INV_PO_Number`	,
+`PO_Date`	,
+`INV_Date`	,
+`Suppliers_Invoice_Number`	,
+`PO_Vendor_Name`	,
+`INV_Vendor_Name`	,
+`PO_Line`	,
+`INV_PO_Line`	,
+`PO_Description`	,
+`INV_Description`	,
+`MRN`	,
+`Facility_Product_Description`	,
+`Contract_Number`	,
+`Contract_Name`	,
+`Contracted_Supplier`	,
+`PO_Quantity`	,
+`INV_Quantity`	,
+`PO_Base_Spend`	,
+`INV_Extended_Spend`	,
+`PO_Base_Price`	,
+`INV_Base_Price`	,
+PO_Base_Spend_actual ,
+INV_Extended_Spend_actual ,
+Matched_Flag	
+
+ from 
+(SELECT 
+
+PO_seq_no  as PO_seq_no, 
+null as INV_seq_no, 
+Transaction_Number          as PO_Number_common,
+Transaction_Number  as PO_Number ,
+null  as INV_PO_Number ,
+Transaction_Date  as PO_Date,
+null  as INV_Date ,
+null  as Suppliers_Invoice_Number,
+a.Vendor_Name as `PO_Vendor_Name`	,
+null  as `INV_Vendor_Name`	,
+Transaction_Line_Number  as PO_Line,
+null  as INV_PO_Line ,
+Product_Description   as  PO_Description,
+null                   as INV_Description,
+a.Manufacturer_Catalog_Number  as MRN,
+Facility_Product_Description   as Facility_Product_Description,
+a.Contract_Number  as Contract_Number,
+a.Contract_Name  as Contract_Name,
+a.Contracted_Supplier  as Contracted_Supplier,
+a.Quantity  as PO_Quantity ,
+null as INV_Quantity ,
+Base_Spend  as PO_Base_Spend ,
+0   as INV_Extended_Spend ,
+a.Last_Base_Price  as PO_Base_Price,
+0  as INV_Base_Price,
+Base_Spend  as  PO_Base_Spend_actual ,
+0  as INV_Extended_Spend_actual ,
+'No_Line_Level_Match_AP_Side'   as  Matched_Flag
+
+
+ FROM 
+{SCHEMA}.PO_Data_{table_name}_v1   a
+ where 
+ PO_seq_no   not in (SELECT distinct PO_seq_no FROM {SCHEMA}.`PO_Master_{table_name}_v1`)) a
+;"
+1,"DROP TABLE IF EXISTS  {SCHEMA}.PO_Data_{table_name}_v1;"
+2,"DROP TABLE IF EXISTS {SCHEMA}.AP_Data_v4_dedup_{table_name}_v1;"
+3,"DROP TABLE IF EXISTS {SCHEMA}.AP_Data_{table_name}_v1;"
+4,"DROP TABLE IF EXISTS {SCHEMA}.`PO_Master_{table_name}_v1` ;"
+7,"INSERT INTO {SCHEMA}.PO_Data_{table_name}_v1    SELECT       PO_seq_no AS `PO_seq_no`,      Purchase_Order_Date AS `Transaction_Date`,      Purchase_Order AS `Transaction_Number`,      PO_Line AS `Transaction_Line_Number`,      NULL AS `Direct_Parent_Entity_Code`,      Company AS `Facility_Name`,      NULL AS `Facility_Department_Number`,      NULL AS `Facility_Department_Name`,      NULL AS `Facility_MMIS`,      NULL AS `Contract_Category`,      Manufacturer AS `Manufacturer_Name`,      Mfr_Part_ID AS `Manufacturer_Catalog_Number`,      Line_Item_Description AS `Product_Description`,      Supplier AS `Vendor_Name`,      NULL AS `Facility_Vendor_Catalog_Num`,      NULL AS `Facility_Manufacturer_Name`,      NULL AS `Facility_Manufacturer_Catalog_Num`,      NULL AS `Facility_Product_Description`,      NULL AS `Facility_Base_Price`,      NULL AS `Facility_Pkg_UOM`,      NULL AS `Facility_UOM_Conv`,      NULL AS `Base_Each_Price`,      NULL AS `Manufacturer_Top_Parent_Name`,      contract_number AS `Contract_Number`,      NULL AS `Contract_Name`,      NULL AS `Contracted_Supplier`,      NULL AS `Contract_Pkg_UOM`,      NULL AS `Contract_UOM_Conv`,      PO_Line_Item_Tags AS `Spend_Type`,      NULL AS `Signed_Tier_Description`,      NULL AS `Packaging_String`,      Unit_of_Measure AS `Pkg_UOM`,      NULL AS `UOM_Conv`,      Commodity_Code AS `UNSPSC_Class_Code`,      NULL AS `UNSPSC_Class_Description`,      NULL AS `UNSPSC_Commodity_Code`,      NULL AS `UNSPSC_Commodity_Description`,      NULL AS `UNSPSC_Family_Code`,      NULL AS `UNSPSC_Family_Description`,      NULL AS `UNSPSC_Segment_Code`,      NULL AS `UNSPSC_Segment_Description`,      NULL AS `Benchmark_Low_Price__Recent_12_Months`,      NULL AS `Benchmark_10th_Percentile__Recent_12_Months`,      NULL AS `Benchmark_25th_Percentile__Recent_12_Months`,      NULL AS `Benchmark_Median_Price__Recent_12_Months`,      NULL AS `Benchmark_High_Price__Recent_12_Months`,      NULL AS `Last_Transaction_Date`,      Quantity_Ordered AS `Quantity`,      NULL AS `Quantity__in_Eaches`,      Extended_Amount AS `Base_Spend`,      Unit_Cost AS `Last_Base_Price`,      NULL AS `Last_Base_Each_Price`,      NULL AS `VENDOR_NAME_ALIAS`,      NULL AS `rnk1`,      NULL AS `PO_Key_columns`,      file_name AS file_name  FROM {SCHEMA}.Purchase_Order_Details pod  WHERE Mfr_Part_ID IN (      SELECT DISTINCT Facility_Manufacturer_Catalog_Num      FROM {SCHEMA}.PO_Data_{table_name}_v1  ) and PO_seq_no  not in ( select distinct PO_seq_no  from {SCHEMA}.PO_Data_{table_name}_v1)   ;  "
+8,"INSERT INTO {SCHEMA}.PO_Data_{table_name}_v1      SELECT        PO_seq_no AS `PO_seq_no`,       Purchase_Order_Date AS `Transaction_Date`,       Purchase_Order AS `Transaction_Number`,       PO_Line AS `Transaction_Line_Number`,       NULL AS `Direct_Parent_Entity_Code`,       Company AS `Facility_Name`,       NULL AS `Facility_Department_Number`,       NULL AS `Facility_Department_Name`,       NULL AS `Facility_MMIS`,       NULL AS `Contract_Category`,       Manufacturer AS `Manufacturer_Name`,       Mfr_Part_ID AS `Manufacturer_Catalog_Number`,       Line_Item_Description AS `Product_Description`,       Supplier AS `Vendor_Name`,       NULL AS `Facility_Vendor_Catalog_Num`,       NULL AS `Facility_Manufacturer_Name`,       NULL AS `Facility_Manufacturer_Catalog_Num`,       NULL AS `Facility_Product_Description`,       NULL AS `Facility_Base_Price`,       NULL AS `Facility_Pkg_UOM`,       NULL AS `Facility_UOM_Conv`,       NULL AS `Base_Each_Price`,       NULL AS `Manufacturer_Top_Parent_Name`,       contract_number AS `Contract_Number`,       NULL AS `Contract_Name`,       NULL AS `Contracted_Supplier`,       NULL AS `Contract_Pkg_UOM`,       NULL AS `Contract_UOM_Conv`,       PO_Line_Item_Tags AS `Spend_Type`,       NULL AS `Signed_Tier_Description`,       NULL AS `Packaging_String`,       Unit_of_Measure AS `Pkg_UOM`,       NULL AS `UOM_Conv`,       Commodity_Code AS `UNSPSC_Class_Code`,       NULL AS `UNSPSC_Class_Description`,       NULL AS `UNSPSC_Commodity_Code`,       NULL AS `UNSPSC_Commodity_Description`,       NULL AS `UNSPSC_Family_Code`,       NULL AS `UNSPSC_Family_Description`,       NULL AS `UNSPSC_Segment_Code`,       NULL AS `UNSPSC_Segment_Description`,       NULL AS `Benchmark_Low_Price__Recent_12_Months`,       NULL AS `Benchmark_10th_Percentile__Recent_12_Months`,       NULL AS `Benchmark_25th_Percentile__Recent_12_Months`,       NULL AS `Benchmark_Median_Price__Recent_12_Months`,       NULL AS `Benchmark_High_Price__Recent_12_Months`,       NULL AS `Last_Transaction_Date`,       Quantity_Ordered AS `Quantity`,       NULL AS `Quantity__in_Eaches`,       Extended_Amount AS `Base_Spend`,       Unit_Cost AS `Last_Base_Price`,       NULL AS `Last_Base_Each_Price`,       NULL AS `VENDOR_NAME_ALIAS`,       NULL AS `rnk1`,       NULL AS `PO_Key_columns`,       file_name AS file_name   FROM {SCHEMA}.Purchase_Order_Details pod   WHERE Mfr_Part_ID IN (       SELECT distinct Mfr_Part_ID FROM admin_fee.Purchase_Order_Details  where contract_number = '{CONTRACT_NAME}'   )  and PO_seq_no  not in ( select distinct PO_seq_no  from {SCHEMA}.PO_Data_{table_name}_v1)    ;"
