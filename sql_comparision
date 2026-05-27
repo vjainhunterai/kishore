@@ -1,0 +1,43 @@
+SELECT 
+    table_schema AS 'Schema',
+    COUNT(*) AS 'Table Count'
+FROM information_schema.tables
+WHERE table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+  AND table_type = 'BASE TABLE'
+GROUP BY table_schema
+ORDER BY table_schema;
+
+
+
+SELECT 
+    table_schema AS 'Schema',
+    SUM(table_rows) AS 'Estimated Record Count'
+FROM information_schema.tables
+WHERE table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+  AND table_type = 'BASE TABLE'
+GROUP BY table_schema
+ORDER BY table_schema;
+
+
+
+SELECT 
+    table_schema AS 'Schema',
+    COUNT(*) AS 'Table Count',
+    SUM(table_rows) AS 'Estimated Records',
+    ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) AS 'Size (MB)'
+FROM information_schema.tables
+WHERE table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+  AND table_type = 'BASE TABLE'
+GROUP BY table_schema
+ORDER BY table_schema;
+
+
+
+
+SELECT CONCAT(
+    'SELECT ''', table_schema, '.', table_name, ''' AS tbl, COUNT(*) AS cnt FROM `',
+    table_schema, '`.`', table_name, '` UNION ALL'
+) AS query
+FROM information_schema.tables
+WHERE table_schema = 'your_schema_name'   -- replace this
+  AND table_type = 'BASE TABLE';
