@@ -1,0 +1,29 @@
+CREATE TABLE admin_fee.MNP_Pool_PP_NS_1445_v1 AS
+ SELECT DISTINCT
+     m.id                AS mnp_id,
+     m.mpn_normalized,
+     m.description_text,
+     m.manufacturer_raw,
+     m.source_field,
+     m.source_system,
+     -- Prefer the input contract_no; fall back to whichever other sibling
+     CASE 
+         WHEN m.contract_no = 'PP-NS-1445' THEN m.contract_no
+         ELSE m.contract_no
+     END                 AS contract_no
+ FROM  admin_fee.mpn_staging_v2 m
+ WHERE m.contract_no IN (
+     SELECT Contract_Number
+     FROM admin_fee.Contract_Group_PP_NS_1445_v1
+ )
+ -- Deduplicate: for same description, keep only one row (longest mpn_normalized wins)
+ QUALIFY ROW_NUMBER() OVER (
+     PARTITION BY m.description_text
+     ORDER BY 
+         CASE WHEN m.contract_no = 'PP-NS-1445' THEN 0 ELSE 1 END ASC,
+         LENGTH(m.mpn_normalized) DESC
+ ) = 1	
+ Error Code: 1064. You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'QUALIFY ROW_NUMBER() OVER (
+     PARTITION BY m.description_text
+     ORDER BY 
+   ' at line 20	0.000 sec
