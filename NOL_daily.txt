@@ -1,0 +1,75 @@
+import os
+
+# Folder paths
+yesterday_folder = r"yesterday"
+today_folder = r"today"
+
+
+def read_file_lines(file_path):
+    """Read file and return lines"""
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.readlines()
+    except:
+        return []
+
+
+def get_python_files(folder):
+    """Get all python files with relative paths"""
+    python_files = {}
+
+    for root, dirs, files in os.walk(folder):
+        for file in files:
+            if file.endswith(".py"):
+
+                full_path = os.path.join(root, file)
+
+                # relative path used for comparison
+                relative_path = os.path.relpath(full_path, folder)
+
+                python_files[relative_path] = full_path
+
+    return python_files
+
+
+# Get all python files
+yesterday_files = get_python_files(yesterday_folder)
+today_files = get_python_files(today_folder)
+
+total_added_lines = 0
+
+print("\n===== LINE COUNT REPORT =====\n")
+
+for relative_file, today_file_path in today_files.items():
+
+    today_lines = read_file_lines(today_file_path)
+
+    # If file exists in yesterday folder
+    if relative_file in yesterday_files:
+
+        yesterday_file_path = yesterday_files[relative_file]
+
+        yesterday_lines = read_file_lines(yesterday_file_path)
+
+        # Find new added lines
+        added_lines = len(today_lines) - len(yesterday_lines)
+
+        # If negative, make 0
+        if added_lines < 0:
+            added_lines = 0
+
+        print(f"{relative_file} --> Added Lines: {added_lines}")
+
+        total_added_lines += added_lines
+
+    else:
+        # Entire new file
+        added_lines = len(today_lines)
+
+        print(f"{relative_file} --> NEW FILE --> Total Lines: {added_lines}")
+
+        total_added_lines += added_lines
+
+print("\n=============================")
+print(f"TOTAL NEW LINES ADDED: {total_added_lines}")
+print("=============================")
