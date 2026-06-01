@@ -33,12 +33,10 @@ DROP TABLE IF EXISTS anomaly.reversal_to_insert;
 --          (temp3 = duplicate rows + matching source INVOICE_AMOUNT)
 -- =====================================================================
 CREATE TABLE anomaly.duplicate_ap_invoice_temp3 AS
-SELECT a.*,
-       b.INVOICE_AMOUNT AS src_invoice_amount
-FROM anomaly.duplicate_ap_invoice a
-INNER JOIN l1_t0004_db.temp_ap_inv b
+SELECT a.*
+FROM anomaly.CCHS_AnomalyHunt_Reversal_dates_request a
+INNER JOIN l1_t0004_db.temp_ap_inv_delaware_all_year_data b
   ON a.seq_no = b.SEQ_NO
-WHERE a.Confirmed = 1;                       -- confirmed duplicates only
 
 
 -- =====================================================================
@@ -54,7 +52,7 @@ SELECT a.SEQ_NO,
        a.SUPPLIER,
        a.INVOICE_AMOUNT,
        a.INVOICE_DATE
-FROM l1_t0004_db.temp_ap_inv a
+FROM l1_t0004_db.temp_ap_inv_delaware_all_year_data a
 LEFT JOIN l3_dm_db.dim_vendor b
   ON a.SUPPLIER = b.vendor_name;
 
@@ -94,7 +92,7 @@ WHERE rnk = 1;
 --          carrying the duplicate pair's new_matched_record_number and
 --          flagged as a reversal. NOT EXISTS prevents double-insert.
 -- =====================================================================
-INSERT INTO anomaly.duplicate_ap_invoice (
+INSERT INTO anomaly.CCHS_AnomalyHunt_Reversal_dates_request (
     seq_no,
     new_matched_record_number,
     Invoice_amount,
@@ -145,11 +143,11 @@ SELECT s.SEQ_NO,
        s.INVOICE_STATUS,
        'Reversal' AS Reason_Grouped             -- so BI can tell it apart
 FROM anomaly.reversal_to_insert r
-INNER JOIN l1_t0004_db.temp_ap_inv s
+INNER JOIN l1_t0004_db.temp_ap_inv_delaware_all_year_data s
   ON r.reversal_seq_no = s.SEQ_NO
 WHERE NOT EXISTS (
     SELECT 1
-    FROM anomaly.duplicate_ap_invoice d
+    FROM anomaly.CCHS_AnomalyHunt_Reversal_dates_request d
     WHERE d.new_matched_record_number = r.new_matched_record_number
       AND d.seq_no = s.SEQ_NO
 );
