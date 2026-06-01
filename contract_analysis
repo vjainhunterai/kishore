@@ -1,0 +1,15 @@
+SELECT 
+    INV_seq_no,
+    INV_Description,
+    Facility_Product_Description,
+    Contract_Number,
+    Matched_Flag
+FROM {SCHEMA}.`PO_Master_PP_CA_449_v1`
+WHERE INV_seq_no IN (
+    150252, 162146, 162147, 180766, 180769, 1334089,  -- ASSURITY
+    180773, 914432,                                    -- GALLANT DR
+    180776, 917158, 917164,                            -- GALLANT HF
+    939216, 973492, 939217,                            -- ISOFLEX LEADS
+    180779                                             -- QUARTET LEAD
+)
+ORDER BY Matched_Flag;
