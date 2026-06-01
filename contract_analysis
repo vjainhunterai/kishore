@@ -35,3 +35,67 @@ WHERE b.seq_no IN (
     939216, 973492, 939217, 180779
 );
 
+
+====
+
+
+SELECT DISTINCT
+    a.Product_Description,
+    a.Facility_Product_Description,
+    b.seq_no,
+    b.Line_Description
+FROM admin_fee.PO_Data_PP_LA_524_v1 a
+JOIN admin_fee.AP_Data_v4_dedup_PP_LA_524_v1 b
+    ON trim(coalesce(a.Facility_Product_Description, a.Product_Description))
+     = trim(LEFT(b.Line_Description,
+                 LENGTH(coalesce(a.Facility_Product_Description, a.Product_Description))))
+WHERE b.seq_no IN (
+    877780, 929703, 995424, 1023338, 1056726,   -- CALIBRATOR ELSCSYS
+    882623, 910291, 995429, 1038320, 1056727, 1095287,  -- CALIBRATOR TROPONIN
+    986774, 1192142, 1218722,                   -- CONTROL MULTIMARKER
+    877781, 929702, 936113, 995472, 1001695, 1001700, 1059545,  -- TESTPACK COBAS EELECSYS
+    919878, 1011665,                            -- TESTPACK PROBNP
+    877790, 892608, 919879, 936114, 980013, 995455, 995477,
+    1027492, 1055321, 1056725, 1072703, 1095286 -- TESTPACK TROPONIN
+);
+
+
+====
+
+
+SELECT DISTINCT
+    a.Product_Description,
+    a.Facility_Product_Description,
+    b.seq_no,
+    b.Line_Description
+FROM admin_fee.PO_Data_PP_NS_1610_v1 a
+JOIN admin_fee.AP_Data_v4_dedup_PP_NS_1610_v1 b
+    ON trim(coalesce(a.Facility_Product_Description, a.Product_Description))
+     = trim(LEFT(b.Line_Description,
+                 LENGTH(coalesce(a.Facility_Product_Description, a.Product_Description))))
+WHERE b.seq_no IN (
+    907263, 961236,   -- CANISTER SUCTION CONNECTOR
+    900326, 958364    -- T.R.A.C. Y-CONNECTOR
+);
+
+
+
+
+SELECT DISTINCT
+    a.Product_Description,
+    a.Facility_Product_Description,
+    b.seq_no,
+    b.Line_Description
+FROM admin_fee.PO_Data_PP_OR_1487_v1 a
+JOIN admin_fee.AP_Data_v4_dedup_PP_OR_1487_v1 b
+    ON trim(coalesce(a.Facility_Product_Description, a.Product_Description))
+     = trim(LEFT(b.Line_Description,
+                 LENGTH(coalesce(a.Facility_Product_Description, a.Product_Description))))
+WHERE b.seq_no IN (
+    1220034,          -- APPLIER CLIP MEDIUM
+    1218875,          -- APPLIER CLIP SURGICLIP III
+    1218874,          -- APPLIER CLIP LARGE
+    880605, 912509, 1021891,  -- DEVICE SUTURING ENDO CLOSE
+    481, 137644, 1160292, 1167554  -- PAN DUST
+);
+
