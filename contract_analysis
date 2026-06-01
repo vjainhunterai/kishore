@@ -13,3 +13,25 @@ WHERE INV_seq_no IN (
     180779                                             -- QUARTET LEAD
 )
 ORDER BY Matched_Flag;
+
+
+
+====
+
+
+SELECT DISTINCT
+    a.Product_Description,
+    a.Facility_Product_Description,
+    b.seq_no,
+    b.Line_Description
+FROM {SCHEMA}.PO_Data_{table_name}_v1 a
+JOIN {SCHEMA}.AP_Data_v4_dedup_{table_name}_v1 b
+    ON trim(coalesce(a.Facility_Product_Description, a.Product_Description))
+     = trim(LEFT(b.Line_Description,
+                 LENGTH(coalesce(a.Facility_Product_Description, a.Product_Description))))
+WHERE b.seq_no IN (
+    150252, 162146, 162147, 180766, 180769, 1334089,
+    180773, 914432, 180776, 917158, 917164,
+    939216, 973492, 939217, 180779
+);
+
