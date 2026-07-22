@@ -1,0 +1,75 @@
+import mysql.connector
+from mysql.connector import Error
+
+
+DB_CONFIG = {
+    "host": "localhost",
+    "port": 3306,
+    "user": "your_username",
+    "password": "your_password",
+    # no "database" here since we touch multiple schemas (l1_/l2_/l3_)
+}
+
+
+def delete_records(execution_id, customer_name, party_group_key, dry_run=True):
+    """
+    Delete invoice records across the three schemas.
+
+    Args:
+        execution_id (str):     value for l1_t0004_db.temp_ap_inv.execution_id
+        customer_name (str):    value for l2_cdm_db.l2_invoice_detail.invhdrNameCustomer
+        party_group_key (int):  value for l3_dm_db.fact_invoice_details.PARTY_GROUP_KEY
+        dry_run (bool):         if True, only counts rows (SELECT) and does NOT delete
+    """
+
+    counts = [
+        ("l1_t0004_db.temp_ap_inv",        "execution_id = %s",       (execution_id,)),
+        ("l2_cdm_db.l2_invoice_detail",    "invhdrNameCustomer = %s", (customer_name,)),
+        ("l3_dm_db.fact_invoice_details",  "PARTY_GROUP_KEY = %s",    (party_group_key,)),
+    ]
+
+    conn = None
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        conn.autocommit = False          # single transaction for all three
+        cur = conn.cursor()
+
+        # 1. Show how many rows each statement would affect
+        print("Row counts:")
+        for table, where, params in counts:
+            cur.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}", params)
+            (n,) = cur.fetchone()
+            print(f"  {table:<35} -> {n} row(s)")
+
+        if dry_run:
+            print("\nDRY RUN: nothing deleted. Set dry_run=False to execute.")
+            return
+
+        # 2. Execute the deletes
+        total = 0
+        for table, where, params in counts:
+            cur.execute(f"DELETE FROM {table} WHERE {where}", params)
+            print(f"  deleted {cur.rowcount} row(s) from {table}")
+            total += cur.rowcount
+
+        conn.commit()                    # commit all three together
+        print(f"\nCommitted. Total rows deleted: {total}")
+
+    except Error as e:
+        if conn:
+            conn.rollback()              # undo everything on any failure
+        print(f"Error (rolled back): {e}")
+        raise
+    finally:
+        if conn and conn.is_connected():
+            cur.close()
+            conn.close()
+
+
+if __name__ == "__main__":
+    delete_records(
+        execution_id="20260523109876",
+        customer_name="BOSTON",
+        party_group_key=6681,
+        dry_run=True,        # flip to False when you're sure
+    )
