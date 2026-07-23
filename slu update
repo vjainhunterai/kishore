@@ -1,9 +1,106 @@
-SELECT DISTINCT SLU_FIELD7,
-       CAST(CAST(SLU_FIELD7 AS DECIMAL(38,10)) AS SIGNED) AS new_val
-FROM l3_dm_db.dim_slu
-WHERE SLU_FIELD7 REGEXP '^-?[0-9]+(\\.[0-9]+)?$';
+-- ============================================================
+-- PRE-DELETE IMPACT CHECK
+-- Run this BEFORE the DELETE statements
+-- ============================================================
+
+-- 1. ROW COUNTS -- how many rows each DELETE will remove
+SELECT 'l1_t0004_db.temp_ap_inv'       AS table_name,
+       COUNT(*)                        AS rows_to_delete
+FROM   l1_t0004_db.temp_ap_inv
+WHERE  execution_id = '20260523109876'
+UNION ALL
+SELECT 'l2_cdm_db.l2_invoice_detail',
+       COUNT(*)
+FROM   l2_cdm_db.l2_invoice_detail
+WHERE  invhdrNameCustomer = 'BOSTON'
+UNION ALL
+SELECT 'l3_dm_db.fact_invoice_details',
+       COUNT(*)
+FROM   l3_dm_db.fact_invoice_details
+WHERE  PARTY_GROUP_KEY = 6681;
 
 
-UPDATE l3_dm_db.dim_slu
-SET SLU_FIELD7 = CAST(CAST(SLU_FIELD7 AS DECIMAL(38,10)) AS SIGNED)
-WHERE SLU_FIELD7 REGEXP '^-?[0-9]+\\.0+$';
+-- 2. TOTAL TABLE ROWS vs ROWS BEING DELETED (% impact)
+SELECT 'l1_t0004_db.temp_ap_inv' AS table_name,
+       (SELECT COUNT(*) FROM l1_t0004_db.temp_ap_inv)                                             AS total_rows,
+       (SELECT COUNT(*) FROM l1_t0004_db.temp_ap_inv WHERE execution_id = '20260523109876')       AS rows_to_delete,
+       ROUND((SELECT COUNT(*) FROM l1_t0004_db.temp_ap_inv WHERE execution_id = '20260523109876')
+             / NULLIF((SELECT COUNT(*) FROM l1_t0004_db.temp_ap_inv), 0) * 100, 2)                AS pct_deleted
+UNION ALL
+SELECT 'l2_cdm_db.l2_invoice_detail',
+       (SELECT COUNT(*) FROM l2_cdm_db.l2_invoice_detail),
+       (SELECT COUNT(*) FROM l2_cdm_db.l2_invoice_detail WHERE invhdrNameCustomer = 'BOSTON'),
+       ROUND((SELECT COUNT(*) FROM l2_cdm_db.l2_invoice_detail WHERE invhdrNameCustomer = 'BOSTON')
+             / NULLIF((SELECT COUNT(*) FROM l2_cdm_db.l2_invoice_detail), 0) * 100, 2)
+UNION ALL
+SELECT 'l3_dm_db.fact_invoice_details',
+       (SELECT COUNT(*) FROM l3_dm_db.fact_invoice_details),
+       (SELECT COUNT(*) FROM l3_dm_db.fact_invoice_details WHERE PARTY_GROUP_KEY = 6681),
+       ROUND((SELECT COUNT(*) FROM l3_dm_db.fact_invoice_details WHERE PARTY_GROUP_KEY = 6681)
+             / NULLIF((SELECT COUNT(*) FROM l3_dm_db.fact_invoice_details), 0) * 100, 2);
+
+
+-- 3. TABLE SIZE ON DISK (data + index, in MB/GB)
+SELECT  TABLE_SCHEMA                                              AS db_name,
+        TABLE_NAME                                                AS table_name,
+        TABLE_ROWS                                                AS approx_rows,
+        ROUND(DATA_LENGTH  / 1024 / 1024, 2)                      AS data_mb,
+        ROUND(INDEX_LENGTH / 1024 / 1024, 2)                      AS index_mb,
+        ROUND((DATA_LENGTH + INDEX_LENGTH) / 1024 / 1024, 2)      AS total_mb,
+        ROUND((DATA_LENGTH + INDEX_LENGTH) / 1024 / 1024 / 1024, 3) AS total_gb,
+        ROUND(DATA_FREE / 1024 / 1024, 2)                         AS free_mb,
+        ENGINE,
+        UPDATE_TIME
+FROM    information_schema.TABLES
+WHERE  (TABLE_SCHEMA = 'l1_t0004_db' AND TABLE_NAME = 'temp_ap_inv')
+    OR (TABLE_SCHEMA = 'l2_cdm_db'   AND TABLE_NAME = 'l2_invoice_detail')
+    OR (TABLE_SCHEMA = 'l3_dm_db'    AND TABLE_NAME = 'fact_invoice_details');
+
+
+-- 4. ESTIMATED SIZE OF DATA BEING DELETED (avg row size x rows to delete)
+SELECT  t.TABLE_SCHEMA,
+        t.TABLE_NAME,
+        ROUND(t.AVG_ROW_LENGTH / 1024, 2)                         AS avg_row_kb,
+        c.rows_to_delete,
+        ROUND(t.AVG_ROW_LENGTH * c.rows_to_delete / 1024 / 1024, 2) AS est_delete_mb
+FROM    information_schema.TABLES t
+JOIN (
+        SELECT 'l1_t0004_db' db, 'temp_ap_inv' tbl,
+               (SELECT COUNT(*) FROM l1_t0004_db.temp_ap_inv WHERE execution_id = '20260523109876') rows_to_delete
+        UNION ALL
+        SELECT 'l2_cdm_db', 'l2_invoice_detail',
+               (SELECT COUNT(*) FROM l2_cdm_db.l2_invoice_detail WHERE invhdrNameCustomer = 'BOSTON')
+        UNION ALL
+        SELECT 'l3_dm_db', 'fact_invoice_details',
+               (SELECT COUNT(*) FROM l3_dm_db.fact_invoice_details WHERE PARTY_GROUP_KEY = 6681)
+      ) c ON c.db = t.TABLE_SCHEMA AND c.tbl = t.TABLE_NAME;
+
+
+-- 5. SAMPLE THE ROWS (eyeball before you pull the trigger)
+SELECT * FROM l1_t0004_db.temp_ap_inv       WHERE execution_id = '20260523109876'     LIMIT 10;
+SELECT * FROM l2_cdm_db.l2_invoice_detail   WHERE invhdrNameCustomer = 'BOSTON'       LIMIT 10;
+SELECT * FROM l3_dm_db.fact_invoice_details WHERE PARTY_GROUP_KEY = 6681              LIMIT 10;
+
+
+
+
+================
+
+
+-- ============================================================
+-- THE DELETE (transactional)
+-- ============================================================
+START TRANSACTION;
+
+DELETE FROM l1_t0004_db.temp_ap_inv       WHERE execution_id = '20260523109876';
+SELECT ROW_COUNT() AS deleted_l1;
+
+DELETE FROM l2_cdm_db.l2_invoice_detail   WHERE invhdrNameCustomer = 'BOSTON';
+SELECT ROW_COUNT() AS deleted_l2;
+
+DELETE FROM l3_dm_db.fact_invoice_details WHERE PARTY_GROUP_KEY = 6681;
+SELECT ROW_COUNT() AS deleted_l3;
+
+-- Verify counts are now 0, then:
+COMMIT;
+-- If anything looks wrong instead: ROLLBACK;
