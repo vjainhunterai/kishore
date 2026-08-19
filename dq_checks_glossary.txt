@@ -1,0 +1,319 @@
+import os
+import pandas as pd
+from sqlalchemy import create_engine, text
+from urllib.parse import quote_plus
+
+
+class RejectReasonCommentUpdater:
+
+    def __init__(
+        self,
+        source_file,
+        output_file,
+        db_host,
+        db_port,
+        db_name,
+        db_user,
+        db_password
+    ):
+        self.source_file = source_file
+        self.output_file = output_file
+
+        password = quote_plus(db_password)
+
+        self.engine = create_engine(
+            f"mysql+pymysql://{db_user}:{password}@"
+            f"{db_host}:{db_port}/{db_name}"
+        )
+
+    # ---------------------------------------------------------
+    # Read DQ check glossary
+    # ---------------------------------------------------------
+    def load_glossary(self):
+
+        query = """
+            SELECT
+                check_name,
+                comments
+            FROM dq_checks_glossery
+            WHERE check_name IS NOT NULL
+              AND comments IS NOT NULL
+        """
+
+        glossary_df = pd.read_sql(query, self.engine)
+
+        if glossary_df.empty:
+            raise ValueError(
+                "dq_checks_glossery table does not contain any check definitions."
+            )
+
+        glossary_df["check_name"] = (
+            glossary_df["check_name"]
+            .astype(str)
+            .str.strip()
+        )
+
+        glossary_df["comments"] = (
+            glossary_df["comments"]
+            .astype(str)
+            .str.strip()
+        )
+
+        # Dictionary:
+        # {
+        #     "null_check": "Value is missing",
+        #     "duplicate_check": "Duplicate value found",
+        #     ...
+        # }
+        glossary = dict(
+            zip(
+                glossary_df["check_name"],
+                glossary_df["comments"]
+            )
+        )
+
+        return glossary
+
+    # ---------------------------------------------------------
+    # Read source file
+    # ---------------------------------------------------------
+    def read_file(self):
+
+        extension = os.path.splitext(self.source_file)[1].lower()
+
+        if extension in [".xlsx", ".xls"]:
+            return pd.read_excel(self.source_file)
+
+        elif extension == ".csv":
+            return pd.read_csv(self.source_file)
+
+        else:
+            raise ValueError(
+                f"Unsupported file type: {extension}"
+            )
+
+    # ---------------------------------------------------------
+    # Identify check name and column name
+    #
+    # Example:
+    # duplicate_check_invoice_number
+    #
+    # check_name  = duplicate_check
+    # column_name = invoice_number
+    # ---------------------------------------------------------
+    def parse_reject_reason(self, reason, glossary):
+
+        reason = str(reason).strip()
+
+        if not reason:
+            return reason
+
+        # Sort check names by length.
+        # This is important because some check names can
+        # potentially be prefixes of other check names.
+        check_names = sorted(
+            glossary.keys(),
+            key=len,
+            reverse=True
+        )
+
+        for check_name in check_names:
+
+            prefix = check_name + "_"
+
+            if reason == check_name:
+                comment = glossary[check_name]
+
+                return comment
+
+            if reason.startswith(prefix):
+
+                column_name = reason[len(prefix):].strip()
+
+                comment = glossary[check_name]
+
+                if column_name:
+                    return f"{comment} for {column_name}"
+
+                return comment
+
+        # If no matching check is found,
+        # keep the original reason.
+        return reason
+
+    # ---------------------------------------------------------
+    # Update one reject reason column
+    # ---------------------------------------------------------
+    def update_reason_column(self, value, glossary):
+
+        if pd.isna(value):
+            return value
+
+        value = str(value).strip()
+
+        if not value:
+            return value
+
+        # Multiple reject reasons are separated by ;
+        reasons = value.split(";")
+
+        updated_reasons = []
+
+        for reason in reasons:
+
+            reason = reason.strip()
+
+            if not reason:
+                continue
+
+            updated_reason = self.parse_reject_reason(
+                reason,
+                glossary
+            )
+
+            updated_reasons.append(updated_reason)
+
+        return ";".join(updated_reasons)
+
+    # ---------------------------------------------------------
+    # Main processing
+    # ---------------------------------------------------------
+    def process(self):
+
+        print("Reading DQ updated data file...")
+
+        df = self.read_file()
+
+        print(f"Input records : {len(df)}")
+        print(f"Input columns : {list(df.columns)}")
+
+        required_columns = [
+            "reject_reason_1",
+            "reject_reason_2"
+        ]
+
+        # -----------------------------------------------------
+        # Check whether reject reason columns exist
+        # -----------------------------------------------------
+        for column in required_columns:
+
+            if column not in df.columns:
+                print(
+                    f"Column '{column}' not found. "
+                    f"Creating it."
+                )
+
+                df[column] = ""
+
+        # -----------------------------------------------------
+        # Load glossary
+        # -----------------------------------------------------
+        print("Loading DQ check glossary...")
+
+        glossary = self.load_glossary()
+
+        print(
+            f"Glossary checks loaded : {len(glossary)}"
+        )
+
+        # -----------------------------------------------------
+        # Update reject_reason_1
+        # -----------------------------------------------------
+        print("Updating reject_reason_1...")
+
+        df["reject_reason_1"] = df[
+            "reject_reason_1"
+        ].apply(
+            lambda x: self.update_reason_column(
+                x,
+                glossary
+            )
+        )
+
+        # -----------------------------------------------------
+        # Update reject_reason_2
+        # -----------------------------------------------------
+        print("Updating reject_reason_2...")
+
+        df["reject_reason_2"] = df[
+            "reject_reason_2"
+        ].apply(
+            lambda x: self.update_reason_column(
+                x,
+                glossary
+            )
+        )
+
+        # -----------------------------------------------------
+        # Write output
+        # -----------------------------------------------------
+        output_extension = os.path.splitext(
+            self.output_file
+        )[1].lower()
+
+        if output_extension in [".xlsx", ".xls"]:
+
+            df.to_excel(
+                self.output_file,
+                index=False
+            )
+
+        elif output_extension == ".csv":
+
+            df.to_csv(
+                self.output_file,
+                index=False
+            )
+
+        else:
+            raise ValueError(
+                f"Unsupported output file type: {output_extension}"
+            )
+
+        print()
+        print("Processing completed successfully.")
+        print(f"Output file : {self.output_file}")
+
+
+# =============================================================
+# CONFIGURATION
+# =============================================================
+
+source_file = (
+    r"D:\kishore\PycharmProjects"
+    r"\universal_dataquality_framework"
+    r"\rejects\OCR_header"
+    r"\DQ_updated_data.xlsx"
+)
+
+output_file = (
+    r"D:\kishore\PycharmProjects"
+    r"\universal_dataquality_framework"
+    r"\rejects\OCR_header"
+    r"\DQ_updated_data_with_comments.xlsx"
+)
+
+
+# MySQL connection details
+DB_HOST = "localhost"
+DB_PORT = 3306
+DB_NAME = "dq_framework_db"
+DB_USER = "root"
+DB_PASSWORD = "your_password"
+
+
+# =============================================================
+# RUN
+# =============================================================
+
+updater = RejectReasonCommentUpdater(
+    source_file=source_file,
+    output_file=output_file,
+    db_host=DB_HOST,
+    db_port=DB_PORT,
+    db_name=DB_NAME,
+    db_user=DB_USER,
+    db_password=DB_PASSWORD
+)
+
+updater.process()
