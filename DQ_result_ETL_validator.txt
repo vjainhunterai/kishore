@@ -1,0 +1,205 @@
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
+
+
+class ETLDQValidationJob:
+
+    def __init__(self, db_url):
+        self.engine = create_engine(db_url)
+
+    def validate(self, pipeline_name):
+
+        try:
+            with self.engine.begin() as connection:
+
+                # ---------------------------------------------------------
+                # Step 1: Get latest execution_id for the pipeline
+                # ---------------------------------------------------------
+
+                execution_query = text("""
+                    SELECT MAX(dr.execution_id) AS execution_id
+                    FROM dq_results dr
+                    JOIN dataset_master dm
+                        ON dr.dataset_id = dm.dataset_id
+                    WHERE dm.dataset_name = :pipeline_name
+                """)
+
+                execution_result = connection.execute(
+                    execution_query,
+                    {
+                        "pipeline_name": pipeline_name
+                    }
+                ).fetchone()
+
+                execution_id = execution_result.execution_id
+
+                if execution_id is None:
+                    print(
+                        f"No DQ execution found for pipeline: "
+                        f"{pipeline_name}"
+                    )
+                    return "ERROR"
+
+                print(f"Pipeline       : {pipeline_name}")
+                print(f"Execution ID   : {execution_id}")
+
+                # ---------------------------------------------------------
+                # Step 2: Get DQ results for latest execution
+                #         and join with dq_check_master
+                # ---------------------------------------------------------
+
+                validation_query = text("""
+                    SELECT
+                        dr.dataset_id,
+                        dr.check_id,
+                        dr.check_name,
+                        dr.column_name,
+                        dr.status,
+                        dcm.severity
+                    FROM dq_results dr
+                    JOIN dq_check_master dcm
+                        ON dr.check_id = dcm.check_id
+                    WHERE dr.execution_id = :execution_id
+                """)
+
+                rows = connection.execute(
+                    validation_query,
+                    {
+                        "execution_id": execution_id
+                    }
+                ).fetchall()
+
+                # ---------------------------------------------------------
+                # Step 3: Identify ERROR severity checks which FAILED
+                # ---------------------------------------------------------
+
+                error_failures = []
+
+                warning_failures = []
+
+                for row in rows:
+
+                    if (
+                        str(row.status).upper() == "FAIL"
+                        and str(row.severity).upper() == "ERROR"
+                    ):
+                        error_failures.append(row)
+
+                    elif (
+                        str(row.status).upper() == "FAIL"
+                        and str(row.severity).upper() == "WARNING"
+                    ):
+                        warning_failures.append(row)
+
+                # ---------------------------------------------------------
+                # Step 4: Determine overall DQ status
+                # ---------------------------------------------------------
+
+                if error_failures:
+                    dq_status = "ERROR"
+                else:
+                    dq_status = "PASS"
+
+                # ---------------------------------------------------------
+                # Step 5: Print validation summary
+                # ---------------------------------------------------------
+
+                print("\n========== DQ VALIDATION SUMMARY ==========")
+
+                print(f"Total DQ results       : {len(rows)}")
+                print(f"ERROR severity failures: {len(error_failures)}")
+                print(f"WARNING failures       : {len(warning_failures)}")
+                print(f"Overall DQ Status      : {dq_status}")
+
+                # ---------------------------------------------------------
+                # Step 6: Print ERROR failures
+                # ---------------------------------------------------------
+
+                if error_failures:
+
+                    print("\nERROR severity checks failed:")
+
+                    for row in error_failures:
+
+                        print(
+                            f"Check: {row.check_name}, "
+                            f"Column: {row.column_name}, "
+                            f"Status: {row.status}, "
+                            f"Severity: {row.severity}"
+                        )
+
+                # ---------------------------------------------------------
+                # Step 7: Print WARNING failures
+                # ---------------------------------------------------------
+
+                if warning_failures:
+
+                    print("\nWARNING severity checks failed:")
+
+                    for row in warning_failures:
+
+                        print(
+                            f"Check: {row.check_name}, "
+                            f"Column: {row.column_name}, "
+                            f"Status: {row.status}, "
+                            f"Severity: {row.severity}"
+                        )
+
+                # ---------------------------------------------------------
+                # Step 8: Store final validation status
+                # ---------------------------------------------------------
+
+                insert_query = text("""
+                    INSERT INTO dq_pipeline_validation_results
+                    (
+                        execution_id,
+                        pipeline_name,
+                        dq_status
+                    )
+                    VALUES
+                    (
+                        :execution_id,
+                        :pipeline_name,
+                        :dq_status
+                    )
+                """)
+
+                connection.execute(
+                    insert_query,
+                    {
+                        "execution_id": execution_id,
+                        "pipeline_name": pipeline_name,
+                        "dq_status": dq_status
+                    }
+                )
+
+                print(
+                    "\nDQ validation result stored successfully."
+                )
+
+                return dq_status
+
+        except SQLAlchemyError as e:
+
+            print("Error while validating DQ results:")
+            print(e)
+
+            return "ERROR"
+
+
+# -------------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------------
+
+if __name__ == "__main__":
+
+    DB_URL = (
+        "mysql+pymysql://username:password@localhost:3306/"
+        "dq_framework_db"
+    )
+
+    job = ETLDQValidationJob(DB_URL)
+
+    status = job.validate("ETL_pipeline")
+
+    print("\nFinal DQ Validation Status:", status)
