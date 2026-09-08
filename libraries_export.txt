@@ -1,0 +1,79 @@
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+def get_installed_libraries(project_root):
+    project_root = Path(project_root)
+
+    # Look for virtual environment
+    possible_venvs = [
+        project_root / ".venv",
+        project_root / "venv",
+        project_root / "env",
+    ]
+
+    venv_path = None
+
+    for path in possible_venvs:
+        if path.exists():
+            venv_path = path
+            break
+
+    if not venv_path:
+        print("Virtual environment not found.")
+        print("Checked:")
+        for path in possible_venvs:
+            print(f"  {path}")
+        return
+
+    # Windows Python executable
+    python_exe = venv_path / "Scripts" / "python.exe"
+
+    if not python_exe.exists():
+        print(f"Python executable not found: {python_exe}")
+        return
+
+    print(f"Project root : {project_root}")
+    print(f"Virtual env  : {venv_path}")
+    print("-" * 60)
+
+    # Get installed packages
+    result = subprocess.run(
+        [str(python_exe), "-m", "pip", "freeze"],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        print("Failed to get installed libraries.")
+        print(result.stderr)
+        return
+
+    libraries = result.stdout.strip().splitlines()
+
+    print(f"Total installed packages: {len(libraries)}")
+    print("-" * 60)
+
+    for library in libraries:
+        print(library)
+
+    # Save to requirements.txt
+    output_file = project_root / "requirements_export.txt"
+
+    with open(output_file, "w", encoding="utf-8") as file:
+        for library in libraries:
+            file.write(library + "\n")
+
+    print("-" * 60)
+    print(f"Library list saved to:")
+    print(output_file)
+
+
+if __name__ == "__main__":
+
+    # Give your ETL project root directory here
+    project_root = r"D:\kishore\PyCharmProjects\your_etl_project"
+
+    get_installed_libraries(project_root)
