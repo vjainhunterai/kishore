@@ -1,0 +1,1138 @@
+import pdfplumber
+import pytesseract
+import pandas as pd
+import re
+
+from pathlib import Path
+from pdf2image import convert_from_path
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+INPUT_FOLDER = Path(r"D:\Invoice\Input")
+OUTPUT_FILE = Path(r"D:\Invoice\Invoice_Detail_Output.xlsx")
+
+MIN_PDF_WORDS = 10
+
+# Y tolerance for grouping words into physical rows
+ROW_TOLERANCE = 5
+
+# Minimum number of columns required for a table
+MIN_COLUMNS = 2
+
+# Maximum gap allowed when grouping header words
+HEADER_WORD_GAP = 35
+
+# How much of the next row must be populated to consider
+# it a strong new row
+NEW_ROW_MIN_FILLED_RATIO = 0.40
+
+
+# ============================================================
+# 1. CLEAN TEXT
+# ============================================================
+
+def clean_text(value):
+
+    if value is None:
+        return ""
+
+    value = str(value)
+
+    value = re.sub(r"\s+", " ", value)
+
+    return value.strip()
+
+
+# ============================================================
+# 2. GET WORDS USING PDFPLUMBER
+# ============================================================
+
+def get_pdfplumber_words(page):
+
+    try:
+
+        words = page.extract_words(
+            x_tolerance=2,
+            y_tolerance=3,
+            keep_blank_chars=False,
+            use_text_flow=False
+        )
+
+        result = []
+
+        for w in words:
+
+            text = clean_text(w.get("text", ""))
+
+            if not text:
+                continue
+
+            result.append({
+                "text": text,
+                "x0": float(w["x0"]),
+                "top": float(w["top"]),
+                "x1": float(w["x1"]),
+                "bottom": float(w["bottom"])
+            })
+
+        return result
+
+    except Exception as e:
+
+        print("pdfplumber extraction error:", e)
+
+        return []
+
+
+# ============================================================
+# 3. GET WORDS USING TESSERACT
+# ============================================================
+
+def get_tesseract_words(pdf_path, page_number):
+
+    try:
+
+        images = convert_from_path(
+            str(pdf_path),
+            first_page=page_number,
+            last_page=page_number,
+            dpi=300
+        )
+
+        if not images:
+            return []
+
+        image = images[0]
+
+        data = pytesseract.image_to_data(
+            image,
+            config="--psm 11",
+            output_type=pytesseract.Output.DICT
+        )
+
+        words = []
+
+        image_width, image_height = image.size
+
+        # We don't know PDF size here.
+        # These coordinates are initially pixel coordinates.
+        for i in range(len(data["text"])):
+
+            text = clean_text(data["text"][i])
+
+            if not text:
+                continue
+
+            try:
+                confidence = float(data["conf"][i])
+            except:
+                confidence = -1
+
+            if confidence < 20:
+                continue
+
+            x = float(data["left"][i])
+            y = float(data["top"][i])
+            w = float(data["width"][i])
+            h = float(data["height"][i])
+
+            words.append({
+                "text": text,
+                "x0": x,
+                "top": y,
+                "x1": x + w,
+                "bottom": y + h
+            })
+
+        return words
+
+    except Exception as e:
+
+        print("Tesseract extraction error:", e)
+
+        return []
+
+
+# ============================================================
+# 4. BUILD PHYSICAL ROWS
+# ============================================================
+
+def build_physical_rows(words):
+
+    if not words:
+        return []
+
+    words = sorted(
+        words,
+        key=lambda x: (x["top"], x["x0"])
+    )
+
+    rows = []
+
+    current_row = []
+    current_top = None
+
+    for word in words:
+
+        if current_top is None:
+
+            current_row = [word]
+            current_top = word["top"]
+
+            continue
+
+        if abs(word["top"] - current_top) <= ROW_TOLERANCE:
+
+            current_row.append(word)
+
+        else:
+
+            current_row = sorted(
+                current_row,
+                key=lambda x: x["x0"]
+            )
+
+            rows.append(current_row)
+
+            current_row = [word]
+            current_top = word["top"]
+
+    if current_row:
+
+        current_row = sorted(
+            current_row,
+            key=lambda x: x["x0"]
+        )
+
+        rows.append(current_row)
+
+    return rows
+
+
+# ============================================================
+# 5. ROW TEXT
+# ============================================================
+
+def row_to_text(row):
+
+    return " ".join(
+        clean_text(w["text"])
+        for w in sorted(row, key=lambda x: x["x0"])
+    )
+
+
+# ============================================================
+# 6. CALCULATE GAPS BETWEEN WORDS
+# ============================================================
+
+def calculate_word_gaps(row):
+
+    row = sorted(row, key=lambda x: x["x0"])
+
+    gaps = []
+
+    for i in range(len(row) - 1):
+
+        gap = row[i + 1]["x0"] - row[i]["x1"]
+
+        gaps.append({
+            "gap": gap,
+            "left": row[i],
+            "right": row[i + 1]
+        })
+
+    return gaps
+
+
+# ============================================================
+# 7. DETECT TABLE HEADER
+#
+# NO HEADER NAMES ARE HARD-CODED.
+#
+# We look for a row that:
+# - contains multiple words
+# - has meaningful horizontal gaps
+# - is followed by rows with similar X structure
+# ============================================================
+
+def detect_header_row(rows):
+
+    if len(rows) < 3:
+        return None
+
+    best_index = None
+    best_score = -1
+
+    for i in range(len(rows) - 2):
+
+        header = rows[i]
+
+        if len(header) < MIN_COLUMNS:
+            continue
+
+        next_rows = rows[i + 1:i + 5]
+
+        if not next_rows:
+            continue
+
+        # ----------------------------------------------------
+        # Header word count
+        # ----------------------------------------------------
+
+        word_count = len(header)
+
+        if word_count < 2:
+            continue
+
+        # ----------------------------------------------------
+        # Detect meaningful horizontal gaps
+        # ----------------------------------------------------
+
+        gaps = calculate_word_gaps(header)
+
+        meaningful_gaps = [
+            g for g in gaps
+            if g["gap"] >= HEADER_WORD_GAP
+        ]
+
+        # ----------------------------------------------------
+        # X positions
+        # ----------------------------------------------------
+
+        header_centers = [
+            (w["x0"] + w["x1"]) / 2
+            for w in header
+        ]
+
+        # ----------------------------------------------------
+        # Check whether following rows use similar
+        # horizontal regions
+        # ----------------------------------------------------
+
+        alignment_score = 0
+
+        for next_row in next_rows:
+
+            if not next_row:
+                continue
+
+            next_centers = [
+                (w["x0"] + w["x1"]) / 2
+                for w in next_row
+            ]
+
+            matched = 0
+
+            for hc in header_centers:
+
+                if any(
+                    abs(hc - nc) < 60
+                    for nc in next_centers
+                ):
+                    matched += 1
+
+            if header_centers:
+
+                alignment_score += (
+                    matched / len(header_centers)
+                )
+
+        alignment_score /= max(len(next_rows), 1)
+
+        # ----------------------------------------------------
+        # Score
+        # ----------------------------------------------------
+
+        score = (
+            word_count * 1.0
+            + len(meaningful_gaps) * 2.0
+            + alignment_score * 10.0
+        )
+
+        # Prefer rows followed by several structured rows
+        if i + 1 < len(rows):
+            score += 2
+
+        if score > best_score:
+
+            best_score = score
+            best_index = i
+
+    return best_index
+
+
+# ============================================================
+# 8. CREATE COLUMN GROUPS FROM HEADER
+#
+# This is completely dynamic.
+#
+# Example:
+#
+# Invoice Date | Description | Qty | Unit Price | Amount
+#
+# or
+#
+# Product | Details | Hours | Rate | Total
+#
+# or anything else.
+# ============================================================
+
+def create_dynamic_columns(header_row):
+
+    header_row = sorted(
+        header_row,
+        key=lambda x: x["x0"]
+    )
+
+    if len(header_row) < MIN_COLUMNS:
+        return []
+
+    # --------------------------------------------------------
+    # First create header blocks.
+    #
+    # Words separated by small gaps can belong to the
+    # same column.
+    # --------------------------------------------------------
+
+    groups = []
+
+    current_group = [header_row[0]]
+
+    for word in header_row[1:]:
+
+        previous = current_group[-1]
+
+        gap = word["x0"] - previous["x1"]
+
+        if gap <= HEADER_WORD_GAP:
+
+            current_group.append(word)
+
+        else:
+
+            groups.append(current_group)
+
+            current_group = [word]
+
+    groups.append(current_group)
+
+    # --------------------------------------------------------
+    # If grouping produced too few columns, fall back to
+    # individual header words.
+    # --------------------------------------------------------
+
+    if len(groups) < MIN_COLUMNS:
+
+        groups = [[w] for w in header_row]
+
+    columns = []
+
+    for index, group in enumerate(groups, start=1):
+
+        left = min(w["x0"] for w in group)
+        right = max(w["x1"] for w in group)
+
+        header_text = " ".join(
+            w["text"] for w in group
+        )
+
+        center = (left + right) / 2
+
+        columns.append({
+            "index": index,
+            "header": clean_text(header_text),
+            "left": left,
+            "right": right,
+            "center": center
+        })
+
+    # --------------------------------------------------------
+    # Recalculate boundaries using midpoint between columns
+    # --------------------------------------------------------
+
+    for i in range(len(columns)):
+
+        if i == 0:
+
+            left_boundary = 0
+
+        else:
+
+            left_boundary = (
+                columns[i - 1]["center"]
+                + columns[i]["center"]
+            ) / 2
+
+        if i == len(columns) - 1:
+
+            right_boundary = float("inf")
+
+        else:
+
+            right_boundary = (
+                columns[i]["center"]
+                + columns[i + 1]["center"]
+            ) / 2
+
+        columns[i]["left_boundary"] = left_boundary
+        columns[i]["right_boundary"] = right_boundary
+
+    return columns
+
+
+# ============================================================
+# 9. ASSIGN WORD TO COLUMN
+# ============================================================
+
+def assign_word_to_column(word, columns):
+
+    center = (
+        word["x0"] + word["x1"]
+    ) / 2
+
+    for column in columns:
+
+        if (
+            center >= column["left_boundary"]
+            and center < column["right_boundary"]
+        ):
+
+            return column["index"] - 1
+
+    return None
+
+
+# ============================================================
+# 10. CONVERT PHYSICAL ROW TO TABLE ROW
+# ============================================================
+
+def row_to_columns(row, columns):
+
+    result = [""] * len(columns)
+
+    for word in sorted(row, key=lambda x: x["x0"]):
+
+        column_index = assign_word_to_column(
+            word,
+            columns
+        )
+
+        if column_index is None:
+            continue
+
+        if result[column_index]:
+
+            result[column_index] += " " + word["text"]
+
+        else:
+
+            result[column_index] = word["text"]
+
+    return [
+        clean_text(value)
+        for value in result
+    ]
+
+
+# ============================================================
+# 11. GENERIC SUMMARY / TOTAL DETECTION
+#
+# This does NOT depend on column names.
+# ============================================================
+
+def is_summary_row(row):
+
+    text = row_to_text(row).lower()
+
+    # Generic summary indicators only
+    patterns = [
+        r"\btotal\b",
+        r"\bsubtotal\b",
+        r"\bsub-total\b",
+        r"\bgrand\s+total\b",
+        r"\bamount\s+due\b",
+        r"\bbalance\s+due\b",
+        r"\bnet\s+amount\b",
+        r"\btax\s+total\b",
+        r"\bpayment\s+information\b",
+        r"\bremittance\b"
+    ]
+
+    for pattern in patterns:
+
+        if re.search(pattern, text):
+
+            return True
+
+    return False
+
+
+# ============================================================
+# 12. DETERMINE IF ROW IS A NEW DETAIL ROW
+#
+# IMPORTANT:
+#
+# NO DATE CHECK
+# NO ITEM NUMBER CHECK
+# NO PRODUCT NUMBER CHECK
+# NO PO NUMBER CHECK
+#
+# Uses only table geometry.
+# ============================================================
+
+def is_new_detail_row(row_values, previous_values):
+
+    if not row_values:
+        return False
+
+    total_columns = len(row_values)
+
+    if total_columns == 0:
+        return False
+
+    filled = sum(
+        1
+        for value in row_values
+        if clean_text(value)
+    )
+
+    filled_ratio = filled / total_columns
+
+    # --------------------------------------------------------
+    # Case 1:
+    # Enough columns are populated
+    # --------------------------------------------------------
+
+    if filled_ratio >= NEW_ROW_MIN_FILLED_RATIO:
+
+        return True
+
+    # --------------------------------------------------------
+    # Case 2:
+    # If previous row is empty/weak and current row has
+    # more information, consider it a new row.
+    # --------------------------------------------------------
+
+    previous_filled = sum(
+        1
+        for value in previous_values
+        if clean_text(value)
+    )
+
+    if previous_filled == 0 and filled > 0:
+
+        return True
+
+    return False
+
+
+# ============================================================
+# 13. MERGE CONTINUATION ROW
+# ============================================================
+
+def merge_continuation_row(
+    previous_row,
+    current_row
+):
+
+    if not previous_row:
+        return current_row
+
+    merged = previous_row.copy()
+
+    for i in range(len(current_row)):
+
+        current_value = clean_text(
+            current_row[i]
+        )
+
+        if not current_value:
+            continue
+
+        if merged[i]:
+
+            merged[i] = (
+                merged[i]
+                + " "
+                + current_value
+            )
+
+        else:
+
+            merged[i] = current_value
+
+    return merged
+
+
+# ============================================================
+# 14. REMOVE COMPLETELY EMPTY ROWS
+# ============================================================
+
+def is_empty_row(row):
+
+    return all(
+        not clean_text(value)
+        for value in row
+    )
+
+
+# ============================================================
+# 15. EXTRACT TABLE FROM PAGE
+# ============================================================
+
+def extract_dynamic_table_from_page(
+    words,
+    pdf_name,
+    page_number
+):
+
+    if not words:
+
+        print("No words found.")
+
+        return []
+
+    # --------------------------------------------------------
+    # Physical rows
+    # --------------------------------------------------------
+
+    rows = build_physical_rows(words)
+
+    if not rows:
+
+        return []
+
+    print()
+    print("=" * 80)
+    print("PDF:", pdf_name)
+    print("PAGE:", page_number)
+    print("=" * 80)
+
+    # --------------------------------------------------------
+    # Print physical rows for debugging
+    # --------------------------------------------------------
+
+    for i, row in enumerate(rows):
+
+        print(
+            f"Physical Row {i}: "
+            f"{row_to_text(row)}"
+        )
+
+    # --------------------------------------------------------
+    # Detect header
+    # --------------------------------------------------------
+
+    header_index = detect_header_row(rows)
+
+    if header_index is None:
+
+        print("Table header not detected.")
+
+        return []
+
+    header_row = rows[header_index]
+
+    print()
+    print("HEADER ROW DETECTED:")
+    print(row_to_text(header_row))
+
+    # --------------------------------------------------------
+    # Dynamic columns
+    # --------------------------------------------------------
+
+    columns = create_dynamic_columns(
+        header_row
+    )
+
+    if len(columns) < MIN_COLUMNS:
+
+        print("Could not create enough columns.")
+
+        return []
+
+    print()
+    print("DYNAMIC COLUMNS:")
+    
+    for column in columns:
+
+        print(
+            column["index"],
+            "|",
+            column["header"],
+            "|",
+            column["left_boundary"],
+            "|",
+            column["right_boundary"]
+        )
+
+    # --------------------------------------------------------
+    # Process rows below header
+    # --------------------------------------------------------
+
+    output_rows = []
+
+    previous_values = None
+
+    current_detail_row = None
+
+    for row_index in range(
+        header_index + 1,
+        len(rows)
+    ):
+
+        physical_row = rows[row_index]
+
+        row_text = row_to_text(
+            physical_row
+        )
+
+        # ----------------------------------------------------
+        # Stop at summary
+        # ----------------------------------------------------
+
+        if is_summary_row(physical_row):
+
+            print()
+            print(
+                "SUMMARY/TOTAL DETECTED - STOPPING:"
+            )
+
+            print(row_text)
+
+            break
+
+        # ----------------------------------------------------
+        # Convert to columns
+        # ----------------------------------------------------
+
+        row_values = row_to_columns(
+            physical_row,
+            columns
+        )
+
+        if is_empty_row(row_values):
+
+            continue
+
+        print()
+        print(
+            "Physical Row:",
+            row_index
+        )
+
+        print(
+            "Raw:",
+            row_text
+        )
+
+        print(
+            "Columns:",
+            row_values
+        )
+
+        # ----------------------------------------------------
+        # First detail row
+        # ----------------------------------------------------
+
+        if current_detail_row is None:
+
+            current_detail_row = row_values
+
+            previous_values = row_values
+
+            continue
+
+        # ----------------------------------------------------
+        # Determine new row dynamically
+        # ----------------------------------------------------
+
+        if is_new_detail_row(
+            row_values,
+            previous_values
+        ):
+
+            output_rows.append(
+                current_detail_row
+            )
+
+            current_detail_row = row_values
+
+        else:
+
+            # ------------------------------------------------
+            # Continuation line
+            # ------------------------------------------------
+
+            current_detail_row = (
+                merge_continuation_row(
+                    current_detail_row,
+                    row_values
+                )
+            )
+
+        previous_values = row_values
+
+    # --------------------------------------------------------
+    # Append final row
+    # --------------------------------------------------------
+
+    if current_detail_row:
+
+        output_rows.append(
+            current_detail_row
+        )
+
+    # --------------------------------------------------------
+    # Add metadata
+    # --------------------------------------------------------
+
+    final_rows = []
+
+    for row in output_rows:
+
+        if is_empty_row(row):
+            continue
+
+        result = {
+            "File Name": pdf_name,
+            "Page Number": page_number
+        }
+
+        for i, column in enumerate(columns):
+
+            header = clean_text(
+                column["header"]
+            )
+
+            # If duplicate/empty headers exist,
+            # generate dynamic names.
+            if not header:
+
+                header = f"Column_{i + 1}"
+
+            if header in result:
+
+                header = (
+                    f"{header}_{i + 1}"
+                )
+
+            result[header] = (
+                row[i]
+                if i < len(row)
+                else ""
+            )
+
+        final_rows.append(result)
+
+    return final_rows
+
+
+# ============================================================
+# 16. PROCESS ONE PDF
+# ============================================================
+
+def process_pdf(pdf_path):
+
+    pdf_name = pdf_path.name
+
+    print()
+    print("#" * 100)
+    print("PROCESSING PDF:", pdf_name)
+    print("#" * 100)
+
+    all_rows = []
+
+    try:
+
+        with pdfplumber.open(pdf_path) as pdf:
+
+            for page_number, page in enumerate(
+                pdf.pages,
+                start=1
+            ):
+
+                print()
+                print(
+                    "Checking page:",
+                    page_number
+                )
+
+                # ------------------------------------------------
+                # First try pdfplumber
+                # ------------------------------------------------
+
+                words = get_pdfplumber_words(
+                    page
+                )
+
+                print(
+                    "pdfplumber words:",
+                    len(words)
+                )
+
+                # ------------------------------------------------
+                # If pdfplumber failed, use Tesseract
+                # ------------------------------------------------
+
+                if len(words) < MIN_PDF_WORDS:
+
+                    print(
+                        "Insufficient pdfplumber text."
+                    )
+
+                    print(
+                        "Using Tesseract..."
+                    )
+
+                    words = get_tesseract_words(
+                        pdf_path,
+                        page_number
+                    )
+
+                    print(
+                        "Tesseract words:",
+                        len(words)
+                    )
+
+                if not words:
+
+                    print(
+                        "No text available on page."
+                    )
+
+                    continue
+
+                # ------------------------------------------------
+                # Extract table
+                # ------------------------------------------------
+
+                page_rows = (
+                    extract_dynamic_table_from_page(
+                        words,
+                        pdf_name,
+                        page_number
+                    )
+                )
+
+                if page_rows:
+
+                    all_rows.extend(
+                        page_rows
+                    )
+
+    except Exception as e:
+
+        print(
+            "PDF processing error:",
+            pdf_name,
+            e
+        )
+
+    return all_rows
+
+
+# ============================================================
+# 17. PROCESS ALL PDFs
+# ============================================================
+
+all_results = []
+
+pdf_files = sorted(
+    INPUT_FOLDER.glob("*.pdf")
+)
+
+print(
+    "Total PDFs found:",
+    len(pdf_files)
+)
+
+for pdf_path in pdf_files:
+
+    try:
+
+        rows = process_pdf(
+            pdf_path
+        )
+
+        if rows:
+
+            all_results.extend(rows)
+
+        else:
+
+            print(
+                "No detail rows extracted:",
+                pdf_path.name
+            )
+
+    except Exception as e:
+
+        print(
+            "Error processing:",
+            pdf_path.name,
+            e
+        )
+
+
+# ============================================================
+# 18. SAVE OUTPUT
+# ============================================================
+
+if all_results:
+
+    df = pd.DataFrame(
+        all_results
+    )
+
+    # File Name MUST be first
+    first_columns = [
+        "File Name",
+        "Page Number"
+    ]
+
+    remaining_columns = [
+        col
+        for col in df.columns
+        if col not in first_columns
+    ]
+
+    df = df[
+        first_columns
+        + remaining_columns
+    ]
+
+    df.to_excel(
+        OUTPUT_FILE,
+        index=False
+    )
+
+    print()
+    print("=" * 100)
+    print("EXTRACTION COMPLETED")
+    print("=" * 100)
+
+    print(
+        "Output file:",
+        OUTPUT_FILE
+    )
+
+    print(
+        "Rows:",
+        len(df)
+    )
+
+    print(
+        "Columns:",
+        list(df.columns)
+    )
+
+else:
+
+    print()
+    print(
+        "No detail data was extracted."
+    )
