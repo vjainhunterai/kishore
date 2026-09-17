@@ -1,0 +1,91 @@
+import pandas as pd
+from pathlib import Path
+
+
+def process_excel_files(input_folder, output_file="excel_file_summary.xlsx"):
+    input_path = Path(input_folder)
+
+    if not input_path.exists():
+        raise FileNotFoundError(f"Folder does not exist: {input_folder}")
+
+    # Get all Excel files
+    excel_files = list(input_path.glob("*.xlsx")) + list(input_path.glob("*.xls"))
+
+    if not excel_files:
+        print("No Excel files found in the input folder.")
+        return
+
+    results = []
+
+    for file_path in excel_files:
+
+        # Skip the output file if it already exists in the same folder
+        if file_path.name == output_file:
+            continue
+
+        try:
+            # First row is treated as header by default
+            df = pd.read_excel(file_path)
+
+            # Required columns validation
+            required_columns = [
+                "INV_extended_spend_actual",
+                "PO_Base_spend_actual"
+            ]
+
+            missing_columns = [
+                col for col in required_columns
+                if col not in df.columns
+            ]
+
+            if missing_columns:
+                print(
+                    f"Skipping {file_path.name} - "
+                    f"Missing columns: {missing_columns}"
+                )
+                continue
+
+            # Convert columns to numeric
+            df["INV_extended_spend_actual"] = pd.to_numeric(
+                df["INV_extended_spend_actual"],
+                errors="coerce"
+            )
+
+            df["PO_Base_spend_actual"] = pd.to_numeric(
+                df["PO_Base_spend_actual"],
+                errors="coerce"
+            )
+
+            # File-wise summary
+            results.append({
+                "file_name": file_path.name,
+                "count": len(df),
+                "sum_INV_extended_spend_actual":
+                    df["INV_extended_spend_actual"].sum(),
+                "sum_PO_Base_spend_actual":
+                    df["PO_Base_spend_actual"].sum()
+            })
+
+            print(f"Processed: {file_path.name}")
+
+        except Exception as e:
+            print(f"Error processing {file_path.name}: {e}")
+
+    # Create summary DataFrame
+    summary_df = pd.DataFrame(results)
+
+    # Write output
+    output_path = input_path / output_file
+    summary_df.to_excel(output_path, index=False)
+
+    print("\nProcessing completed.")
+    print(f"Output file: {output_path}")
+
+    return summary_df
+
+
+if __name__ == "__main__":
+
+    input_folder = r"C:\Users\YourName\Documents\Input"
+
+    process_excel_files(input_folder)
