@@ -1,0 +1,1233 @@
+import re
+from pathlib import Path
+
+import pdfplumber
+import pandas as pd
+
+# OCR fallback
+import pytesseract
+from pdf2image import convert_from_path
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+INPUT_FOLDER = r"D:\Invoice\Input"
+OUTPUT_FILE = r"D:\Invoice\Contract_Output.xlsx"
+
+MIN_PDF_WORDS = 10
+
+# Used only for fallback extraction
+ROW_TOLERANCE = 5
+
+# ============================================================
+# TEXT CLEANING
+# ============================================================
+
+def clean_cell(value):
+
+    if value is None:
+        return ""
+
+    value = str(value)
+
+    # Preserve multiline cell content
+    lines = []
+
+    for line in value.splitlines():
+
+        line = re.sub(
+            r"[ \t]+",
+            " ",
+            line
+        ).strip()
+
+        if line:
+            lines.append(line)
+
+    return "\n".join(lines)
+
+
+def clean_row(row):
+
+    return [
+        clean_cell(value)
+        for value in row
+    ]
+
+
+# ============================================================
+# PDFPLUMBER WORDS
+# ============================================================
+
+def get_pdfplumber_words(page):
+
+    try:
+
+        words = page.extract_words(
+            x_tolerance=2,
+            y_tolerance=3,
+            keep_blank_chars=False
+        )
+
+        return [
+            word
+            for word in words
+            if clean_cell(
+                word.get("text", "")
+            )
+        ]
+
+    except Exception as e:
+
+        print(
+            "pdfplumber word error:",
+            e
+        )
+
+        return []
+
+
+# ============================================================
+# TESSERACT FALLBACK
+# ============================================================
+
+def get_tesseract_words(
+    pdf_path,
+    page_number
+):
+
+    try:
+
+        images = convert_from_path(
+            str(pdf_path),
+            first_page=page_number,
+            last_page=page_number,
+            dpi=300
+        )
+
+        if not images:
+            return []
+
+        image = images[0]
+
+        data = pytesseract.image_to_data(
+            image,
+            config="--psm 11",
+            output_type=pytesseract.Output.DICT
+        )
+
+        page_width, page_height = image.size
+
+        words = []
+
+        for i in range(
+            len(data["text"])
+        ):
+
+            text = clean_cell(
+                data["text"][i]
+            )
+
+            if not text:
+                continue
+
+            try:
+                confidence = float(
+                    data["conf"][i]
+                )
+            except:
+                confidence = -1
+
+            if confidence < 0:
+                continue
+
+            left = float(
+                data["left"][i]
+            )
+
+            top = float(
+                data["top"][i]
+            )
+
+            width = float(
+                data["width"][i]
+            )
+
+            height = float(
+                data["height"][i]
+            )
+
+            # Coordinate scale
+            x0 = (
+                left
+                / page_width
+                * 612
+            )
+
+            x1 = (
+                (left + width)
+                / page_width
+                * 612
+            )
+
+            pdf_top = (
+                top
+                / page_height
+                * 792
+            )
+
+            pdf_bottom = (
+                (top + height)
+                / page_height
+                * 792
+            )
+
+            words.append(
+                {
+                    "text": text,
+                    "x0": x0,
+                    "x1": x1,
+                    "top": pdf_top,
+                    "bottom": pdf_bottom
+                }
+            )
+
+        return words
+
+    except Exception as e:
+
+        print(
+            "Tesseract error:",
+            e
+        )
+
+        return []
+
+
+# ============================================================
+# TABLE EXTRACTION
+#
+# FIRST:
+#   Actual PDF table lines
+#
+# SECOND:
+#   Text alignment
+#
+# No fixed column count.
+# ============================================================
+
+def extract_tables_from_page(page):
+
+    tables = []
+
+    # --------------------------------------------------------
+    # METHOD 1
+    # Actual table lines / borders
+    # --------------------------------------------------------
+
+    line_settings = {
+        "vertical_strategy": "lines",
+        "horizontal_strategy": "lines",
+
+        "snap_tolerance": 5,
+        "snap_x_tolerance": 5,
+        "snap_y_tolerance": 5,
+
+        "join_tolerance": 5,
+        "join_x_tolerance": 5,
+        "join_y_tolerance": 5,
+
+        "intersection_tolerance": 5,
+        "intersection_x_tolerance": 5,
+        "intersection_y_tolerance": 5,
+
+        "edge_min_length": 3,
+
+        "text_x_tolerance": 3,
+        "text_y_tolerance": 3
+    }
+
+    try:
+
+        tables = page.find_tables(
+            table_settings=line_settings
+        )
+
+    except Exception as e:
+
+        print(
+            "Line table detection error:",
+            e
+        )
+
+        tables = []
+
+    valid_tables = []
+
+    for table in tables:
+
+        extracted = table.extract(
+            x_tolerance=3,
+            y_tolerance=3
+        )
+
+        if extracted:
+
+            valid_tables.append(
+                extracted
+            )
+
+    if valid_tables:
+
+        return valid_tables
+
+
+    # --------------------------------------------------------
+    # METHOD 2
+    # Tables without visible borders
+    #
+    # Use text alignment.
+    # --------------------------------------------------------
+
+    text_settings = {
+        "vertical_strategy": "text",
+        "horizontal_strategy": "text",
+
+        "min_words_vertical": 2,
+        "min_words_horizontal": 1,
+
+        "snap_tolerance": 5,
+        "snap_x_tolerance": 5,
+        "snap_y_tolerance": 5,
+
+        "join_tolerance": 5,
+        "join_x_tolerance": 5,
+        "join_y_tolerance": 5,
+
+        "intersection_tolerance": 5,
+        "intersection_x_tolerance": 5,
+        "intersection_y_tolerance": 5,
+
+        "text_x_tolerance": 3,
+        "text_y_tolerance": 3
+    }
+
+    try:
+
+        tables = page.find_tables(
+            table_settings=text_settings
+        )
+
+    except Exception as e:
+
+        print(
+            "Text table detection error:",
+            e
+        )
+
+        tables = []
+
+    valid_tables = []
+
+    for table in tables:
+
+        extracted = table.extract(
+            x_tolerance=3,
+            y_tolerance=3
+        )
+
+        if extracted:
+
+            # Require at least 2 rows
+            # and at least 2 populated cells
+            # somewhere in the table.
+            non_empty_rows = 0
+            max_populated = 0
+
+            for row in extracted:
+
+                populated = sum(
+                    bool(clean_cell(v))
+                    for v in row
+                )
+
+                if populated:
+                    non_empty_rows += 1
+
+                max_populated = max(
+                    max_populated,
+                    populated
+                )
+
+            if (
+                non_empty_rows >= 2
+                and max_populated >= 2
+            ):
+
+                valid_tables.append(
+                    extracted
+                )
+
+    return valid_tables
+
+
+# ============================================================
+# PRINT TABLE FOR DEBUGGING
+# ============================================================
+
+def print_detected_table(
+    table,
+    page_number,
+    table_number
+):
+
+    print()
+    print(
+        "=" * 90
+    )
+
+    print(
+        "TABLE FOUND"
+    )
+
+    print(
+        "Page:",
+        page_number
+    )
+
+    print(
+        "Table:",
+        table_number
+    )
+
+    print(
+        "Rows:",
+        len(table)
+    )
+
+    max_columns = max(
+        (
+            len(row)
+            for row in table
+        ),
+        default=0
+    )
+
+    print(
+        "Detected columns:",
+        max_columns
+    )
+
+    print(
+        "-" * 90
+    )
+
+    for row_number, row in enumerate(
+        table,
+        start=1
+    ):
+
+        print(
+            f"Row {row_number}:",
+            [
+                clean_cell(v)
+                for v in row
+            ]
+        )
+
+
+# ============================================================
+# DETERMINE WHETHER TABLE HAS A HEADER
+#
+# We do NOT require particular header names.
+# ============================================================
+
+def looks_like_header(row):
+
+    if not row:
+        return False
+
+    populated = [
+        clean_cell(v)
+        for v in row
+        if clean_cell(v)
+    ]
+
+    if len(populated) < 2:
+        return False
+
+    # Header is usually mostly text and does not
+    # consist primarily of monetary/numeric values.
+
+    numeric_count = 0
+
+    for value in populated:
+
+        if re.fullmatch(
+            r"[\$€£]?\s*[\d,]+(?:\.\d+)?",
+            value
+        ):
+
+            numeric_count += 1
+
+    return numeric_count < (
+        len(populated) / 2
+    )
+
+
+# ============================================================
+# TABLE → OUTPUT ROWS
+#
+# No fixed column count.
+# ============================================================
+
+def convert_table_to_output(
+    table,
+    file_name,
+    page_number,
+    table_number
+):
+
+    if not table:
+        return []
+
+    table = [
+        clean_row(row)
+        for row in table
+    ]
+
+    # Remove completely empty rows
+    table = [
+        row
+        for row in table
+        if any(
+            clean_cell(v)
+            for v in row
+        )
+    ]
+
+    if not table:
+        return []
+
+    # --------------------------------------------------------
+    # Determine maximum number of physical columns
+    # --------------------------------------------------------
+
+    column_count = max(
+        len(row)
+        for row in table
+    )
+
+    # --------------------------------------------------------
+    # Check first row for header
+    # --------------------------------------------------------
+
+    has_header = looks_like_header(
+        table[0]
+    )
+
+    if has_header:
+
+        header_row = table[0]
+
+        data_rows = table[1:]
+
+    else:
+
+        header_row = []
+
+        data_rows = table
+
+    # --------------------------------------------------------
+    # Create output
+    # --------------------------------------------------------
+
+    output = []
+
+    for row_number, row in enumerate(
+        data_rows,
+        start=1
+    ):
+
+        # Pad row to same physical width
+        row = list(row)
+
+        while len(row) < column_count:
+
+            row.append("")
+
+        result = {
+            "File Name": file_name,
+            "Page Number": page_number,
+            "Table Number": table_number
+        }
+
+        for i in range(
+            column_count
+        ):
+
+            if has_header:
+
+                header = clean_cell(
+                    header_row[i]
+                    if i < len(header_row)
+                    else ""
+                )
+
+            else:
+
+                header = ""
+
+            if not header:
+
+                header = f"Column {i + 1}"
+
+            # Prevent duplicate headers
+            original_header = header
+
+            counter = 2
+
+            while header in result:
+
+                header = (
+                    f"{original_header}_{counter}"
+                )
+
+                counter += 1
+
+            result[header] = row[i]
+
+        output.append(
+            result
+        )
+
+    return output
+
+
+# ============================================================
+# AMOUNT DETECTION
+#
+# ONLY USED IF NO TABLE IS FOUND.
+# ============================================================
+
+def row_has_amount(row):
+
+    text = clean_cell(
+        " ".join(
+            word["text"]
+            for word in row
+        )
+    )
+
+    return bool(
+        re.search(
+            r"(?:[$€£]\s*)?\(?\d[\d,]*(?:\.\d{1,2})?\)?",
+            text
+        )
+    )
+
+
+# ============================================================
+# BUILD PHYSICAL ROWS
+# ============================================================
+
+def build_physical_rows(words):
+
+    if not words:
+        return []
+
+    words = sorted(
+        words,
+        key=lambda w: (
+            w["top"],
+            w["x0"]
+        )
+    )
+
+    rows = []
+
+    for word in words:
+
+        placed = False
+
+        for row in rows:
+
+            avg_top = sum(
+                w["top"]
+                for w in row
+            ) / len(row)
+
+            if abs(
+                word["top"]
+                - avg_top
+            ) <= ROW_TOLERANCE:
+
+                row.append(word)
+
+                placed = True
+
+                break
+
+        if not placed:
+
+            rows.append(
+                [word]
+            )
+
+    for row in rows:
+
+        row.sort(
+            key=lambda w: w["x0"]
+        )
+
+    rows.sort(
+        key=lambda row:
+        min(
+            w["top"]
+            for w in row
+        )
+    )
+
+    return rows
+
+
+# ============================================================
+# FALLBACK:
+# DESCRIPTION + AMOUNT
+#
+# This is used ONLY when no table was detected.
+# ============================================================
+
+def extract_description_amount_fallback(
+    words,
+    file_name,
+    page_number
+):
+
+    rows = build_physical_rows(
+        words
+    )
+
+    candidate_rows = []
+
+    for row in rows:
+
+        text = clean_cell(
+            " ".join(
+                word["text"]
+                for word in row
+            )
+        )
+
+        if not text:
+            continue
+
+        if not re.search(
+            r"[A-Za-z]",
+            text
+        ):
+            continue
+
+        if row_has_amount(row):
+
+            candidate_rows.append(
+                row
+            )
+
+    if not candidate_rows:
+
+        return []
+
+    # --------------------------------------------------------
+    # We need repeated candidates.
+    #
+    # This prevents normal contract paragraphs with one
+    # number/date from being treated as product data.
+    # --------------------------------------------------------
+
+    if len(candidate_rows) < 2:
+
+        return []
+
+    # --------------------------------------------------------
+    # Find repeated X gap positions.
+    # --------------------------------------------------------
+
+    gap_positions = []
+
+    for row in candidate_rows:
+
+        row = sorted(
+            row,
+            key=lambda w: w["x0"]
+        )
+
+        for i in range(
+            len(row) - 1
+        ):
+
+            gap = (
+                row[i + 1]["x0"]
+                - row[i]["x1"]
+            )
+
+            if gap >= 25:
+
+                gap_positions.append(
+                    (
+                        row[i]["x1"]
+                        + row[i + 1]["x0"]
+                    ) / 2
+                )
+
+    if not gap_positions:
+
+        return []
+
+    gap_positions.sort()
+
+    # --------------------------------------------------------
+    # Group nearby X positions
+    # --------------------------------------------------------
+
+    groups = []
+
+    for x in gap_positions:
+
+        if not groups:
+
+            groups.append([x])
+
+        elif abs(
+            x - groups[-1][-1]
+        ) <= 15:
+
+            groups[-1].append(x)
+
+        else:
+
+            groups.append([x])
+
+    boundaries = []
+
+    for group in groups:
+
+        if len(group) >= 2:
+
+            boundaries.append(
+                sum(group) / len(group)
+            )
+
+    if not boundaries:
+
+        return []
+
+    # --------------------------------------------------------
+    # Split fallback rows
+    # --------------------------------------------------------
+
+    output = []
+
+    for row in candidate_rows:
+
+        values = [
+            ""
+            for _ in range(
+                len(boundaries) + 1
+            )
+        ]
+
+        for word in sorted(
+            row,
+            key=lambda w: w["x0"]
+        ):
+
+            center = (
+                word["x0"]
+                + word["x1"]
+            ) / 2
+
+            column_index = 0
+
+            for boundary in boundaries:
+
+                if center < boundary:
+                    break
+
+                column_index += 1
+
+            text = clean_cell(
+                word["text"]
+            )
+
+            if not text:
+                continue
+
+            if values[column_index]:
+
+                values[column_index] += (
+                    " " + text
+                )
+
+            else:
+
+                values[column_index] = text
+
+        result = {
+            "File Name": file_name,
+            "Page Number": page_number
+        }
+
+        for i, value in enumerate(
+            values,
+            start=1
+        ):
+
+            result[
+                f"Column {i}"
+            ] = clean_cell(value)
+
+        output.append(
+            result
+        )
+
+    return output
+
+
+# ============================================================
+# PROCESS ONE PAGE
+# ============================================================
+
+def process_contract_page(
+    page,
+    pdf_path,
+    page_number
+):
+
+    print()
+    print(
+        "-" * 90
+    )
+
+    print(
+        "PAGE:",
+        page_number
+    )
+
+    # ========================================================
+    # 1. TABLE EXTRACTION
+    # ========================================================
+
+    tables = extract_tables_from_page(
+        page
+    )
+
+    if tables:
+
+        print(
+            "TABLES DETECTED:",
+            len(tables)
+        )
+
+        page_output = []
+
+        for table_number, table in enumerate(
+            tables,
+            start=1
+        ):
+
+            print_detected_table(
+                table,
+                page_number,
+                table_number
+            )
+
+            table_output = convert_table_to_output(
+                table,
+                pdf_path.name,
+                page_number,
+                table_number
+            )
+
+            page_output.extend(
+                table_output
+            )
+
+        if page_output:
+
+            print(
+                "TABLE EXTRACTION USED"
+            )
+
+            return page_output
+
+    # ========================================================
+    # 2. NO TABLE
+    #
+    # Try pdfplumber words first.
+    # ========================================================
+
+    words = get_pdfplumber_words(
+        page
+    )
+
+    print(
+        "pdfplumber words:",
+        len(words)
+    )
+
+    # OCR fallback
+    if len(words) < MIN_PDF_WORDS:
+
+        print(
+            "Using Tesseract fallback..."
+        )
+
+        words = get_tesseract_words(
+            pdf_path,
+            page_number
+        )
+
+        print(
+            "Tesseract words:",
+            len(words)
+        )
+
+    if not words:
+
+        print(
+            "No text on page."
+        )
+
+        return []
+
+    # ========================================================
+    # 3. DESCRIPTION + AMOUNT FALLBACK
+    # ========================================================
+
+    fallback_output = (
+        extract_description_amount_fallback(
+            words,
+            pdf_path.name,
+            page_number
+        )
+    )
+
+    if fallback_output:
+
+        print(
+            "DESCRIPTION + AMOUNT FALLBACK USED"
+        )
+
+        return fallback_output
+
+    # ========================================================
+    # 4. NOTHING FOUND
+    # ========================================================
+
+    print(
+        "NO TABLE AND NO DESCRIPTION + AMOUNT DATA"
+    )
+
+    return []
+
+
+# ============================================================
+# PROCESS ONE PDF
+# ============================================================
+
+def process_contract_pdf(
+    pdf_path
+):
+
+    all_rows = []
+
+    print()
+    print(
+        "=" * 100
+    )
+
+    print(
+        "PROCESSING:",
+        pdf_path.name
+    )
+
+    print(
+        "=" * 100
+    )
+
+    try:
+
+        with pdfplumber.open(
+            pdf_path
+        ) as pdf:
+
+            print(
+                "TOTAL PAGES:",
+                len(pdf.pages)
+            )
+
+            # IMPORTANT:
+            # Scan ALL pages.
+            for page_number, page in enumerate(
+                pdf.pages,
+                start=1
+            ):
+
+                try:
+
+                    page_rows = process_contract_page(
+                        page,
+                        pdf_path,
+                        page_number
+                    )
+
+                    if page_rows:
+
+                        all_rows.extend(
+                            page_rows
+                        )
+
+                        print(
+                            "OUTPUT ROWS:",
+                            len(page_rows)
+                        )
+
+                except Exception as e:
+
+                    print(
+                        "ERROR ON PAGE",
+                        page_number,
+                        ":",
+                        e
+                    )
+
+                    # Continue with next page
+                    continue
+
+    except Exception as e:
+
+        print(
+            "PDF ERROR:",
+            pdf_path.name,
+            ":",
+            e
+        )
+
+    return all_rows
+
+
+# ============================================================
+# RUN ALL PDFs
+# ============================================================
+
+def run_contract_extraction():
+
+    input_folder = Path(
+        INPUT_FOLDER
+    )
+
+    pdf_files = sorted(
+        input_folder.glob("*.pdf")
+    )
+
+    print(
+        "PDF FILES:",
+        len(pdf_files)
+    )
+
+    all_rows = []
+
+    for pdf_path in pdf_files:
+
+        pdf_rows = process_contract_pdf(
+            pdf_path
+        )
+
+        if pdf_rows:
+
+            all_rows.extend(
+                pdf_rows
+            )
+
+    # ========================================================
+    # SAVE OUTPUT
+    # ========================================================
+
+    if not all_rows:
+
+        print()
+        print(
+            "NO CONTRACT DATA FOUND."
+        )
+
+        return
+
+    df = pd.DataFrame(
+        all_rows
+    )
+
+    # File Name / Page Number / Table Number first
+    first_columns = [
+        "File Name",
+        "Page Number"
+    ]
+
+    if "Table Number" in df.columns:
+
+        first_columns.append(
+            "Table Number"
+        )
+
+    remaining_columns = [
+        column
+        for column in df.columns
+        if column not in first_columns
+    ]
+
+    df = df[
+        first_columns
+        + remaining_columns
+    ]
+
+    df.to_excel(
+        OUTPUT_FILE,
+        index=False
+    )
+
+    print()
+    print(
+        "=" * 100
+    )
+
+    print(
+        "CONTRACT EXTRACTION COMPLETED"
+    )
+
+    print(
+        "TOTAL OUTPUT ROWS:",
+        len(df)
+    )
+
+    print(
+        "TOTAL OUTPUT COLUMNS:",
+        len(df.columns)
+    )
+
+    print(
+        "OUTPUT FILE:",
+        OUTPUT_FILE
+    )
+
+    print(
+        "=" * 100
+    )
+
+
+# ============================================================
+# START
+# ============================================================
+
+run_contract_extraction()
