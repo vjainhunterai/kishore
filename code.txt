@@ -1,0 +1,152 @@
+
+import subprocess
+from pathlib import Path
+
+# --------------------------------------------------
+# 1. CONFIGURATION
+# --------------------------------------------------
+project_root = Path(
+    r"C:\Users\kishore\PycharmProjects\graph_test"
+)
+
+code2flow = Path(
+    r"C:\Users\kishore\PycharmProjects\graph_test\venv\Scripts\code2flow.exe"
+)
+
+output_dir = project_root / "_code2flow_diagnostics"
+output_dir.mkdir(exist_ok=True)
+
+# --------------------------------------------------
+# 2. FIND PYTHON FILES
+# --------------------------------------------------
+excluded_dirs = {
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".git",
+    "_code2flow_diagnostics",
+}
+
+python_files = [
+    p for p in project_root.rglob("*.py")
+    if not any(part in excluded_dirs for part in p.parts)
+]
+
+print(f"Project root: {project_root}")
+print(f"Python files found: {len(python_files)}")
+
+if not code2flow.exists():
+    raise FileNotFoundError(
+        f"Code2flow executable not found: {code2flow}"
+    )
+
+if not python_files:
+    raise RuntimeError("No Python files found.")
+
+# --------------------------------------------------
+# 3. TEST EACH FILE INDIVIDUALLY
+# --------------------------------------------------
+failed_files = []
+timed_out_files = []
+
+for index, file_path in enumerate(python_files, start=1):
+    test_output = output_dir / f"test_{index}.png"
+
+    try:
+        result = subprocess.run(
+            [
+                str(code2flow),
+                str(file_path),
+                "-o",
+                str(test_output),
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=60,
+        )
+
+        if result.returncode != 0:
+            failed_files.append(file_path)
+            print(f"\nFAILED: {file_path}")
+            print((result.stderr or result.stdout)[-1500:])
+
+        else:
+            print(
+                f"[{index}/{len(python_files)}] "
+                f"PASS: {file_path.relative_to(project_root)}"
+            )
+
+    except subprocess.TimeoutExpired:
+        timed_out_files.append(file_path)
+        print(f"\nTIMEOUT: {file_path}")
+
+# --------------------------------------------------
+# 4. SUMMARY
+# --------------------------------------------------
+print("\n========== TEST SUMMARY ==========")
+print(f"Total Python files : {len(python_files)}")
+print(f"Failed files       : {len(failed_files)}")
+print(f"Timed-out files    : {len(timed_out_files)}")
+
+for file_path in failed_files:
+    print(f"FAILED FILE: {file_path}")
+
+for file_path in timed_out_files:
+    print(f"TIMEOUT FILE: {file_path}")
+
+
+# --------------------------------------------------
+# 5. CREATE COMBINED PROJECT GRAPH
+#    ONLY IF ALL INDIVIDUAL FILES PASS
+# --------------------------------------------------
+if failed_files or timed_out_files:
+    print(
+        "\nGraph generation skipped because "
+        "some files did not pass."
+    )
+
+else:
+    print("\nAll individual files passed.")
+    print("Generating combined project graph...")
+
+    project_graph = project_root / "project_callgraph.png"
+
+    # Pass only the Python files discovered by our script.
+    # This prevents Code2flow from scanning the venv.
+    source_files = [
+        str(p) for p in python_files
+        if p.name != "find_code2flow_error.py"
+    ]
+
+    try:
+        result = subprocess.run(
+            [
+                str(code2flow),
+                *source_files,
+                "--skip-parse-errors",
+                "-o",
+                str(project_graph),
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=600,
+        )
+
+        if result.returncode == 0 and project_graph.exists():
+            print("\nSUCCESS: Combined project graph created.")
+            print(f"Image: {project_graph}")
+
+            subprocess.Popen(
+                ["cmd", "/c", "start", "", str(project_graph)]
+            )
+        else:
+            print("\nCombined graph generation FAILED.")
+            print("STDOUT:")
+            print(result.stdout[-3000:])
+            print("STDERR:")
+            print(result.stderr[-3000:])
+
+    except subprocess.TimeoutExpired:
+        print("\nGraph generation timed out after 10 minutes.")
