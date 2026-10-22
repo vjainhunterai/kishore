@@ -1,0 +1,650 @@
+
+import ast
+import base64
+import csv
+import subprocess
+import sys
+import struct
+import tokenize
+from pathlib import Path
+from collections import Counter, defaultdict
+from xml.sax.saxutils import escape
+
+
+# =========================================================
+# 1. CONFIGURATION
+# =========================================================
+
+project_root = Path(
+    r"C:\Users\kishore\PycharmProjects\graph_test"
+).resolve()
+
+code2flow = Path(
+    r"D:\tools\code2flow-venv\Scripts\code2flow.exe"
+)
+
+output_dir = project_root / "_code2flow_diagnostics"
+output_dir.mkdir(exist_ok=True)
+
+graph_png = project_root / "project_callgraph.png"
+combined_svg = project_root / "project_callgraph_summary.svg"
+function_csv = project_root / "function_metrics.csv"
+imports_csv = project_root / "imports_summary.csv"
+summary_txt = project_root / "project_summary.txt"
+
+excluded_dirs = {
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".idea",
+    "_code2flow_diagnostics",
+}
+
+script_path = Path(__file__).resolve()
+
+
+# =========================================================
+# 2. DISCOVER PROJECT FILES
+# =========================================================
+
+python_files = sorted(
+    p for p in project_root.rglob("*.py")
+    if not any(part in excluded_dirs for part in p.parts)
+    and p.resolve() != script_path
+    and p != graph_png
+)
+
+if not code2flow.exists():
+    raise FileNotFoundError(
+        f"Code2flow executable not found: {code2flow}"
+    )
+
+if not python_files:
+    raise RuntimeError("No Python files found.")
+
+print(f"Project root: {project_root}")
+print(f"Python files found: {len(python_files)}")
+
+
+# =========================================================
+# 3. SOURCE METRICS
+# =========================================================
+
+def get_code_lines(source):
+    """Return physical line numbers containing Python code."""
+    code_lines = set()
+
+    try:
+        tokens = tokenize.generate_tokens(
+            iter(source.splitlines(keepends=True)).__next__
+        )
+
+        ignored = {
+            tokenize.ENCODING,
+            tokenize.NL,
+            tokenize.NEWLINE,
+            tokenize.INDENT,
+            tokenize.DEDENT,
+            tokenize.COMMENT,
+            tokenize.ENDMARKER,
+        }
+
+        for token in tokens:
+            if token.type in ignored:
+                continue
+
+            start_line = token.start[0]
+            end_line = token.end[0]
+
+            for line_number in range(start_line, end_line + 1):
+                code_lines.add(line_number)
+
+    except (tokenize.TokenError, IndentationError):
+        # AST parsing will report source syntax issues separately.
+        pass
+
+    return code_lines
+
+
+def get_call_name(node):
+    """Get a best-effort name for a callable expression."""
+    if isinstance(node, ast.Name):
+        return node.id
+
+    if isinstance(node, ast.Attribute):
+        prefix = get_call_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+
+    if isinstance(node, ast.Call):
+        return get_call_name(node.func)
+
+    if isinstance(node, ast.Subscript):
+        return get_call_name(node.value)
+
+    return ""
+
+
+def collect_calls(node):
+    """Collect statically recognizable function calls."""
+    calls = []
+
+    class CallVisitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, child):
+            if child is not node:
+                return
+            self.generic_visit(child)
+
+        def visit_AsyncFunctionDef(self, child):
+            if child is not node:
+                return
+            self.generic_visit(child)
+
+        def visit_Lambda(self, child):
+            return
+
+        def visit_Call(self, child):
+            name = get_call_name(child.func)
+            if name:
+                calls.append(name)
+            self.generic_visit(child)
+
+    CallVisitor().visit(node)
+    return calls
+
+
+def module_root(import_name):
+    return import_name.split(".")[0] if import_name else ""
+
+
+stdlib_modules = getattr(sys, "stdlib_module_names", set())
+
+internal_roots = {
+    p.stem for p in project_root.glob("*.py")
+}
+internal_roots.update(
+    p.name for p in project_root.iterdir()
+    if p.is_dir() and p.name not in excluded_dirs
+)
+
+
+# =========================================================
+# 4. ANALYZE EACH FILE
+# =========================================================
+
+file_records = []
+function_records = []
+import_records = []
+all_function_names = Counter()
+parse_errors = []
+
+for file_path in python_files:
+    relative_path = str(file_path.relative_to(project_root))
+
+    try:
+        source = file_path.read_text(encoding="utf-8-sig")
+        tree = ast.parse(source, filename=relative_path)
+    except (SyntaxError, UnicodeDecodeError) as exc:
+        parse_errors.append((relative_path, str(exc)))
+        print(f"PARSE ERROR: {relative_path}: {exc}")
+        continue
+
+    lines = source.splitlines()
+    code_line_numbers = get_code_lines(source)
+
+    functions_in_file = []
+    classes_in_file = []
+    imports_in_file = []
+
+    class Analyzer(ast.NodeVisitor):
+        def __init__(self):
+            self.scope = []
+
+        def visit_ClassDef(self, node):
+            classes_in_file.append({
+                "class_name": ".".join(self.scope + [node.name]),
+                "file": relative_path,
+                "line": node.lineno,
+            })
+
+            self.scope.append(node.name)
+            for child in node.body:
+                self.visit(child)
+            self.scope.pop()
+
+        def visit_FunctionDef(self, node):
+            self.add_function(node)
+
+        def visit_AsyncFunctionDef(self, node):
+            self.add_function(node)
+
+        def add_function(self, node):
+            qualified_name = ".".join(self.scope + [node.name])
+            start = node.lineno
+            end = getattr(node, "end_lineno", start)
+
+            function_code_lines = sum(
+                1 for line_no in code_line_numbers
+                if start <= line_no <= end
+            )
+
+            calls = collect_calls(node)
+
+            record = {
+                "file": relative_path,
+                "function": qualified_name,
+                "start_line": start,
+                "end_line": end,
+                "span_lines": end - start + 1,
+                "code_lines": function_code_lines,
+                "call_count": len(calls),
+                "calls": calls,
+                "caller_count": 0,
+            }
+
+            functions_in_file.append(record)
+            all_function_names[node.name] += 1
+
+            # Visit nested functions so they are counted separately.
+            self.scope.append(node.name)
+            for child in node.body:
+                self.visit(child)
+            self.scope.pop()
+
+        def visit_Import(self, node):
+            for alias in node.names:
+                imports_in_file.append(alias.name)
+
+        def visit_ImportFrom(self, node):
+            if node.module:
+                imports_in_file.append(node.module)
+
+    Analyzer().visit(tree)
+
+    # Count physical lines, including blank/comment lines.
+    total_lines = len(lines)
+
+    # Include import usage by file.
+    for import_name in sorted(set(imports_in_file)):
+        root_name = module_root(import_name)
+
+        if root_name in internal_roots:
+            category = "Internal"
+        elif root_name in stdlib_modules:
+            category = "Standard library"
+        else:
+            category = "Third-party or unknown"
+
+        import_records.append({
+            "file": relative_path,
+            "import_name": import_name,
+            "category": category,
+        })
+
+    file_records.append({
+        "file": relative_path,
+        "total_lines": total_lines,
+        "code_lines": len(code_line_numbers),
+        "function_count": len(functions_in_file),
+        "class_count": len(classes_in_file),
+        "imports": sorted(set(imports_in_file)),
+    })
+
+    function_records.extend(functions_in_file)
+
+
+# =========================================================
+# 5. ESTIMATE FUNCTION CALLERS
+# =========================================================
+
+# This is a name-based estimate, not full semantic resolution.
+for caller in function_records:
+    for call_name in caller["calls"]:
+        short_name = call_name.rsplit(".", 1)[-1]
+
+        for target in function_records:
+            if target["function"].rsplit(".", 1)[-1] == short_name:
+                if target is not caller:
+                    target["caller_count"] += 1
+
+
+# =========================================================
+# 6. WRITE FUNCTION METRICS CSV
+# =========================================================
+
+with function_csv.open(
+    "w", newline="", encoding="utf-8-sig"
+) as file:
+    fieldnames = [
+        "file",
+        "function",
+        "start_line",
+        "end_line",
+        "span_lines",
+        "code_lines",
+        "call_count",
+        "caller_count",
+        "calls",
+    ]
+
+    writer = csv.DictWriter(file, fieldnames=fieldnames)
+    writer.writeheader()
+
+    for record in sorted(
+        function_records,
+        key=lambda r: (-r["code_lines"], r["file"], r["function"])
+    ):
+        row = record.copy()
+        row["calls"] = "; ".join(row["calls"])
+        writer.writerow({key: row[key] for key in fieldnames})
+
+
+# =========================================================
+# 7. WRITE IMPORT SUMMARY CSV
+# =========================================================
+
+with imports_csv.open(
+    "w", newline="", encoding="utf-8-sig"
+) as file:
+    fieldnames = ["file", "import_name", "category"]
+    writer = csv.DictWriter(file, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(import_records)
+
+
+# =========================================================
+# 8. PROJECT SUMMARY
+# =========================================================
+
+total_lines = sum(r["total_lines"] for r in file_records)
+total_code_lines = sum(r["code_lines"] for r in file_records)
+total_functions = len(function_records)
+total_classes = sum(r["class_count"] for r in file_records)
+
+unique_imports = sorted({
+    r["import_name"] for r in import_records
+})
+
+category_counts = Counter(
+    r["category"] for r in import_records
+)
+
+orphan_candidates = [
+    r for r in function_records
+    if r["caller_count"] == 0
+]
+
+leaf_functions = [
+    r for r in function_records
+    if r["call_count"] == 0
+]
+
+largest_functions = sorted(
+    function_records,
+    key=lambda r: r["code_lines"],
+    reverse=True,
+)[:10]
+
+summary_lines = [
+    "PROJECT CODE SUMMARY",
+    "=" * 60,
+    f"Project root: {project_root}",
+    f"Python files discovered: {len(python_files)}",
+    f"Files successfully analyzed: {len(file_records)}",
+    f"Files with syntax/encoding errors: {len(parse_errors)}",
+    f"Total physical lines: {total_lines:,}",
+    f"Code lines (excluding blank/comment lines): {total_code_lines:,}",
+    f"Functions and methods: {total_functions:,}",
+    f"Classes: {total_classes:,}",
+    f"Distinct imported module names: {len(unique_imports):,}",
+    "",
+    "IMPORT CATEGORIES",
+    "-" * 60,
+]
+
+for category, count in sorted(category_counts.items()):
+    summary_lines.append(f"{category}: {count}")
+
+summary_lines.extend([
+    "",
+    "IMPORTED MODULES",
+    "-" * 60,
+    *unique_imports,
+    "",
+    "LARGEST FUNCTIONS BY CODE LINES",
+    "-" * 60,
+])
+
+for record in largest_functions:
+    summary_lines.append(
+        f'{record["code_lines"]:>5} lines | '
+        f'{record["file"]} | {record["function"]}'
+    )
+
+summary_lines.extend([
+    "",
+    "FUNCTIONS WITH NO DETECTED CALLERS (CANDIDATES)",
+    "-" * 60,
+])
+
+for record in orphan_candidates[:50]:
+    summary_lines.append(
+        f'{record["file"]} | {record["function"]}'
+    )
+
+summary_lines.extend([
+    "",
+    "FUNCTIONS THAT CALL NOTHING ELSE",
+    "-" * 60,
+])
+
+for record in leaf_functions[:50]:
+    summary_lines.append(
+        f'{record["file"]} | {record["function"]}'
+    )
+
+summary_txt.write_text(
+    "\n".join(summary_lines),
+    encoding="utf-8",
+)
+
+print("\n".join(summary_lines[:15]))
+
+
+# =========================================================
+# 9. TEST EACH FILE WITH CODE2FLOW
+# =========================================================
+
+failed_files = []
+timed_out_files = []
+
+for index, file_path in enumerate(python_files, start=1):
+    if not any(
+        r["file"] == str(file_path.relative_to(project_root))
+        for r in file_records
+    ):
+        failed_files.append(file_path)
+        continue
+
+    test_output = output_dir / f"test_{index}.png"
+
+    try:
+        result = subprocess.run(
+            [
+                str(code2flow),
+                str(file_path),
+                "-o",
+                str(test_output),
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=60,
+        )
+
+        if result.returncode != 0:
+            failed_files.append(file_path)
+            print(f"CODE2FLOW FAILED: {file_path}")
+            print((result.stderr or result.stdout)[-1000:])
+        else:
+            print(
+                f"[{index}/{len(python_files)}] PASS: "
+                f"{file_path.relative_to(project_root)}"
+            )
+
+    except subprocess.TimeoutExpired:
+        timed_out_files.append(file_path)
+        print(f"TIMEOUT: {file_path}")
+
+
+# =========================================================
+# 10. GENERATE COMBINED GRAPH
+# =========================================================
+
+if failed_files or timed_out_files:
+    print("\nCombined graph skipped: individual tests failed.")
+    print(f"Failed files: {len(failed_files)}")
+    print(f"Timed-out files: {len(timed_out_files)}")
+
+else:
+    source_files = [
+        str(p) for p in python_files
+        if p.resolve() != script_path
+    ]
+
+    print("\nGenerating combined graph...")
+
+    try:
+        result = subprocess.run(
+            [
+                str(code2flow),
+                *source_files,
+                "--skip-parse-errors",
+                "-o",
+                str(graph_png),
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=600,
+        )
+
+        if result.returncode != 0 or not graph_png.exists():
+            print("Combined graph generation failed.")
+            print((result.stderr or result.stdout)[-4000:])
+            sys.exit(1)
+
+    except subprocess.TimeoutExpired:
+        print("Combined graph timed out.")
+        sys.exit(1)
+
+
+# =========================================================
+# 11. EMBED GRAPH AND SUMMARY IN ONE SVG IMAGE
+# =========================================================
+
+png_bytes = graph_png.read_bytes()
+png_base64 = base64.b64encode(png_bytes).decode("ascii")
+
+# PNG width and height are stored in its header.
+graph_width, graph_height = struct.unpack(
+    ">II", png_bytes[16:24]
+)
+
+header_height = 310
+canvas_width = max(graph_width, 1200)
+canvas_height = graph_height + header_height
+
+def svg_text(x, y, value, size=16, bold=False):
+    weight = "bold" if bold else "normal"
+    return (
+        f'<text x="{x}" y="{y}" '
+        f'font-family="Arial, sans-serif" '
+        f'font-size="{size}" font-weight="{weight}" '
+        f'fill="#202124">{escape(str(value))}</text>'
+    )
+
+summary_svg = []
+
+summary_svg.append(svg_text(
+    24, 34, "PROJECT CODE SUMMARY", 25, True
+))
+
+summary_svg.append(svg_text(
+    24, 66, f"Project: {project_root}", 14
+))
+
+summary_svg.append(svg_text(
+    24, 105, f"Python files discovered: {len(python_files)}"
+))
+summary_svg.append(svg_text(
+    24, 135, f"Files analyzed: {len(file_records)}"
+))
+summary_svg.append(svg_text(
+    24, 165, f"Physical lines: {total_lines:,}"
+))
+summary_svg.append(svg_text(
+    24, 195, f"Code lines: {total_code_lines:,}"
+))
+summary_svg.append(svg_text(
+    24, 225, f"Functions/methods: {total_functions:,}"
+))
+summary_svg.append(svg_text(
+    24, 255, f"Classes: {total_classes:,}"
+))
+
+summary_svg.append(svg_text(
+    440, 105, f"Distinct imported modules: {len(unique_imports):,}"
+))
+summary_svg.append(svg_text(
+    440, 135,
+    f"Standard-library imports: {category_counts['Standard library']}"
+))
+summary_svg.append(svg_text(
+    440, 165,
+    f"Third-party/unknown imports: {category_counts['Third-party or unknown']}"
+))
+summary_svg.append(svg_text(
+    440, 195,
+    f"Internal imports: {category_counts['Internal']}"
+))
+summary_svg.append(svg_text(
+    440, 225,
+    f"Functions with no detected callers: {len(orphan_candidates)}"
+))
+summary_svg.append(svg_text(
+    440, 255,
+    f"Functions calling nothing else: {len(leaf_functions)}"
+))
+summary_svg.append(svg_text(
+    24, 290,
+    "Note: caller counts are name-based estimates; nested function LOC can overlap.",
+    12
+))
+
+svg_document = f'''<svg xmlns="http://www.w3.org/2000/svg"
+    width="{canvas_width}" height="{canvas_height}"
+    viewBox="0 0 {canvas_width} {canvas_height}">
+    <rect width="100%" height="100%" fill="#ffffff"/>
+    <rect x="0" y="0" width="100%" height="{header_height}"
+        fill="#f1f4f8"/>
+    {''.join(summary_svg)}
+    <image x="0" y="{header_height}"
+        width="{graph_width}" height="{graph_height}"
+        href="data:image/png;base64,{png_base64}"
+        xmlns:xlink="http://www.w3.org/1999/xlink"
+        xlink:href="data:image/png;base64,{png_base64}"/>
+</svg>'''
+
+combined_svg.write_text(svg_document, encoding="utf-8")
+
+print("\n========== FINAL OUTPUTS ==========")
+print(f"Graph PNG       : {graph_png}")
+print(f"Combined image  : {combined_svg}")
+print(f"Function report : {function_csv}")
+print(f"Import report   : {imports_csv}")
+print(f"Summary report  : {summary_txt}")
+
+subprocess.Popen(
+    ["cmd", "/c", "start", "", str(combined_svg)]
+)
