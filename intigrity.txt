@@ -1,0 +1,120 @@
+
+import pandas as pd
+from sqlalchemy import text
+
+from src.checks.base_check import BaseCheck
+from src.connection_manager import get_engine
+
+
+class AnomalyReconciliationCheck(BaseCheck):
+
+    def execute(self, df, config):
+
+        result = []
+
+        # Read metadata configuration
+        config_file = config["config_file_path"]
+
+        tolerance = config.get("amount_tolerance") or 0
+        tolerance = float(tolerance)
+
+        amount_columns = config.get("amount_columns") or []
+
+        if isinstance(amount_columns, str):
+            amount_columns = [
+                col.strip() for col in amount_columns.split(",")
+                if col.strip()
+            ]
+
+        # Read active mappings
+        mappings = pd.read_csv(config_file)
+        mappings = mappings[
+            mappings["active_flag"].astype(str).str.strip() == "1"
+        ]
+
+        engine = get_engine()
+
+        for _, mapping in mappings.iterrows():
+
+            source_col = mapping["source_column"]
+            target_col = mapping["target_column"]
+            target_table = mapping["target_table"]
+            join_col = mapping["join_column"]
+
+            # Get source join values
+            keys = df[join_col].dropna().unique().tolist()
+
+            target_data = pd.DataFrame()
+
+            if keys:
+
+                placeholders = ", ".join(
+                    [f":k{i}" for i in range(len(keys))]
+                )
+
+                sql = text(f"""
+                    SELECT {join_col}, {target_col}
+                    FROM {target_table}
+                    WHERE {join_col} IN ({placeholders})
+                """)
+
+                params = {
+                    f"k{i}": key for i, key in enumerate(keys)
+                }
+
+                with engine.connect() as conn:
+                    target_data = pd.read_sql(
+                        sql, conn, params=params
+                    )
+
+            # Map target values to source records
+            target_lookup = dict(
+                zip(target_data[join_col], target_data[target_col])
+            )
+
+            target_values = df[join_col].map(target_lookup)
+
+            # Compare values
+            if source_col in amount_columns:
+
+                source_values = pd.to_numeric(
+                    df[source_col], errors="coerce"
+                )
+
+                target_values = pd.to_numeric(
+                    target_values, errors="coerce"
+                )
+
+                matched = (
+                    source_values.notna()
+                    & target_values.notna()
+                    & ((source_values - target_values).abs() <= tolerance)
+                )
+
+                # Both values blank are treated as equal
+                matched = matched | (
+                    source_values.isna() & target_values.isna()
+                    & target_values.notna()
+                )
+
+            else:
+                matched = df[source_col].eq(target_values)
+
+            # Missing target records are always failures
+            matched = matched & df[join_col].isin(target_lookup)
+
+            failed_df = df[~matched].copy()
+
+            if not failed_df.empty:
+                failed_df["target_table"] = target_table
+
+            failed_count = len(failed_df)
+
+            result.append({
+                "column": source_col,
+                "status": "PASS" if failed_count == 0 else "FAIL",
+                "failed_count": failed_count,
+                "failed_df": failed_df
+            })
+
+        return result
