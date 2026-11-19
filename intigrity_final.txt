@@ -1,0 +1,298 @@
+
+import re
+import pandas as pd
+
+from sqlalchemy import text
+
+from src.checks.base_check import BaseCheck
+from src.connection_manager import get_engine
+
+
+class AnomalyReconciliationCheck(BaseCheck):
+
+    def execute(self, df, config):
+
+        result = []
+
+        # Read metadata configuration
+        config_file = config.get("config_file_path")
+
+        if not config_file:
+            raise ValueError("config_file_path is missing")
+
+        tolerance = float(config.get("amount_tolerance") or 0)
+
+        amount_columns = config.get("amount_columns") or []
+
+        if isinstance(amount_columns, str):
+            amount_columns = [
+                col.strip() for col in amount_columns.split(",")
+                if col.strip()
+            ]
+
+        # Read Excel configuration
+        mappings = pd.read_excel(config_file)
+
+        required_columns = [
+            "source_column",
+            "target_column",
+            "target_table",
+            "join_column",
+            "active_flag"
+        ]
+
+        if not set(required_columns).issubset(mappings.columns):
+            raise ValueError("Invalid reconciliation configuration columns")
+
+        mappings = mappings[
+            mappings["active_flag"].astype(str).str.strip().str.lower()
+            .isin(["1", "true", "yes", "y"])
+        ]
+
+        if mappings.empty:
+            raise ValueError("No active reconciliation mappings found")
+
+        engine = get_engine()
+
+        # Input Excel must contain the common sequence key
+        if "seq_no" not in df.columns:
+            raise ValueError("seq_no column is missing in input Excel")
+
+        seq_keys = df["seq_no"].dropna().drop_duplicates().tolist()
+
+        if not seq_keys:
+            raise ValueError("No valid seq_no values found in input Excel")
+
+        # Validate SQL identifiers from controlled configuration
+        def quote_identifier(value):
+            value = str(value).strip()
+
+            if not re.fullmatch(r"[A-Za-z0-9_]+", value):
+                raise ValueError(f"Invalid SQL identifier: {value}")
+
+            return engine.dialect.identifier_preparer.quote(value)
+
+        def quote_table(value):
+            parts = str(value).strip().split(".")
+
+            if len(parts) != 2:
+                raise ValueError(
+                    f"Table must be in database.table format: {value}"
+                )
+
+            return ".".join(quote_identifier(part) for part in parts)
+
+        # Fetch source data in batches
+        def fetch_source(table, columns, join_column, keys):
+
+            table_sql = quote_table(table)
+            join_sql = quote_identifier(join_column)
+            select_columns = [join_column] + columns
+
+            select_sql = ", ".join(
+                quote_identifier(col) for col in select_columns
+            )
+
+            frames = []
+
+            for start in range(0, len(keys), 500):
+
+                batch = keys[start:start + 500]
+
+                params = {
+                    f"k{i}": value for i, value in enumerate(batch)
+                }
+
+                placeholders = ", ".join(
+                    f":k{i}" for i in range(len(batch))
+                )
+
+                query = text(f"""
+                    SELECT {select_sql}
+                    FROM {table_sql}
+                    WHERE {join_sql} IN ({placeholders})
+                """)
+
+                with engine.connect() as conn:
+                    frames.append(
+                        pd.read_sql(query, conn, params=params)
+                    )
+
+            if not frames:
+                return pd.DataFrame(columns=select_columns)
+
+            return pd.concat(frames, ignore_index=True)
+
+        # Fetch the intermediate table once
+        temp_table = "l1_t0004_db.temp_ap_inv_uw_all_year_data"
+
+        temp_columns = mappings[
+            mappings["target_table"].astype(str).str.strip()
+            == temp_table
+        ]["target_column"].drop_duplicates().tolist()
+
+        temp_data = fetch_source(
+            temp_table,
+            temp_columns + ["hash_key"],
+            "seq_no",
+            seq_keys
+        )
+
+        # Fetch UW source table
+        uw_table = "uw.uw_all_source_data"
+
+        uw_columns = mappings[
+            mappings["target_table"].astype(str).str.strip()
+            == uw_table
+        ]["target_column"].drop_duplicates().tolist()
+
+        uw_data = fetch_source(
+            uw_table,
+            uw_columns,
+            "seq_no",
+            seq_keys
+        )
+
+        # Fetch sequence table through hash_key
+        sequence_table = "l1_t0004_db.SEQ_ap_inv_v2_uw"
+
+        sequence_mappings = mappings[
+            mappings["target_table"].astype(str).str.strip()
+            == sequence_table
+        ]
+
+        sequence_data = pd.DataFrame()
+
+        if not sequence_mappings.empty:
+
+            hash_keys = (
+                temp_data["hash_key"].dropna().drop_duplicates().tolist()
+                if "hash_key" in temp_data.columns else []
+            )
+
+            sequence_data = fetch_source(
+                sequence_table,
+                ["INV_SEQ_NO"],
+                "hash_key",
+                hash_keys
+            )
+
+            # Translate the hash-key result back to seq_no
+            sequence_data = temp_data[
+                ["seq_no", "hash_key"]
+            ].merge(
+                sequence_data,
+                on="hash_key",
+                how="inner"
+            )
+
+        # Compare values
+        for _, mapping in mappings.iterrows():
+
+            source_col = str(mapping["source_column"]).strip()
+            target_col = str(mapping["target_column"]).strip()
+            target_table = str(mapping["target_table"]).strip()
+
+            if source_col not in df.columns:
+                raise ValueError(
+                    f"Input column '{source_col}' is missing"
+                )
+
+            if target_col == "hash_key":
+                raise ValueError(
+                    "hash_key is an intermediate join column, "
+                    "not a comparison column"
+                )
+
+            # Select the corresponding source data
+            if target_table == temp_table:
+                source_data = temp_data
+
+            elif target_table == uw_table:
+                source_data = uw_data
+
+            elif target_table == sequence_table:
+                source_data = sequence_data
+
+            else:
+                raise ValueError(
+                    f"Unsupported target table: {target_table}"
+                )
+
+            if target_col not in source_data.columns:
+                raise ValueError(
+                    f"Target column '{target_col}' not found "
+                    f"in {target_table}"
+                )
+
+            # Match source rows using seq_no.
+            # If a key has multiple target rows, accept a match only
+            # when one target row matches the source value.
+            target_groups = {
+                key: group[target_col].tolist()
+                for key, group in source_data.groupby("seq_no")
+            }
+
+            failed_indices = []
+            reject_reasons = []
+
+            for index, row in df.iterrows():
+
+                key = row["seq_no"]
+                source_value = row[source_col]
+
+                if pd.isna(key) or key not in target_groups:
+                    failed_indices.append(index)
+                    reject_reasons.append("Target record not found")
+                    continue
+
+                target_values = target_groups[key]
+
+                def values_match(target_value):
+
+                    if pd.isna(source_value) and pd.isna(target_value):
+                        return True
+
+                    if pd.isna(source_value) or pd.isna(target_value):
+                        return False
+
+                    if source_col in amount_columns:
+
+                        source_number = pd.to_numeric(
+                            pd.Series([source_value]), errors="coerce"
+                        ).iloc[0]
+
+                        target_number = pd.to_numeric(
+                            pd.Series([target_value]), errors="coerce"
+                        ).iloc[0]
+
+                        if pd.isna(source_number) or pd.isna(target_number):
+                            return False
+
+                        return (
+                            abs(float(source_number) - float(target_number))
+                            <= tolerance
+                        )
+
+                    return source_value == target_value
+
+                if not any(values_match(value) for value in target_values):
+                    failed_indices.append(index)
+                    reject_reasons.append("Source value mismatch")
+
+            failed_df = df.loc[failed_indices].copy()
+
+            if not failed_df.empty:
+                failed_df["reject_reason"] = reject_reasons
+                failed_df["target_table"] = target_table
+
+            failed_count = len(failed_df)
+
+            result.append({
+                "column": source_col,
+                "status": "PASS" if failed_count == 0 else "FAIL",
+                "failed_count": failed_count,
+                "failed_df": failed_df
+            })
+
+        return result
