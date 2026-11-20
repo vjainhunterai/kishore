@@ -1,0 +1,361 @@
+
+import re
+from collections import Counter
+
+import pandas as pd
+from sqlalchemy import text
+
+from src.checks.base_check import BaseCheck
+from src.connection_manager import get_engine
+
+
+class AnomalyReconciliationCheck(BaseCheck):
+
+    BATCH_SIZE = 1000
+
+    def execute(self, df, config):
+
+        results = []
+
+        # -------------------------------------------------
+        # 1. Read metadata configuration
+        # -------------------------------------------------
+
+        config_file = config.get("config_file_path")
+
+        if not config_file:
+            raise ValueError("config_file_path is missing")
+
+        tolerance = float(config.get("amount_tolerance") or 0)
+
+        amount_columns = config.get("amount_columns") or []
+
+        if isinstance(amount_columns, str):
+            amount_columns = [
+                col.strip()
+                for col in amount_columns.split(",")
+                if col.strip()
+            ]
+
+        amount_columns = set(amount_columns)
+
+        # -------------------------------------------------
+        # 2. Read reconciliation Excel configuration
+        # -------------------------------------------------
+
+        mappings = pd.read_excel(config_file)
+
+        required_columns = [
+            "source_column",
+            "target_column",
+            "target_table",
+            "join_column",
+            "active_flag"
+        ]
+
+        missing_columns = [
+            col for col in required_columns
+            if col not in mappings.columns
+        ]
+
+        if missing_columns:
+            raise ValueError(
+                f"Missing configuration columns: {missing_columns}"
+            )
+
+        mappings = mappings[
+            mappings["active_flag"].astype(str).str.strip().str.lower()
+            .isin(["1", "true", "yes", "y"])
+        ].copy()
+
+        if mappings.empty:
+            raise ValueError("No active reconciliation mappings found")
+
+        # -------------------------------------------------
+        # 3. Validate input columns
+        # -------------------------------------------------
+
+        if "seq_no" not in df.columns:
+            raise ValueError("seq_no column is missing in input Excel")
+
+        # Remove duplicate input index ambiguity
+        df = df.reset_index(drop=True)
+
+        # -------------------------------------------------
+        # 4. Get distinct seq_no values
+        # -------------------------------------------------
+
+        seq_keys = df["seq_no"].dropna().drop_duplicates().tolist()
+
+        if not seq_keys:
+            raise ValueError("No valid seq_no values found")
+
+        # -------------------------------------------------
+        # 5. Prepare database connection and identifiers
+        # -------------------------------------------------
+
+        engine = get_engine()
+
+        identifier_pattern = re.compile(r"^[A-Za-z0-9_]+$")
+
+        def quote_identifier(value):
+
+            value = str(value).strip()
+
+            if not identifier_pattern.fullmatch(value):
+                raise ValueError(
+                    f"Invalid SQL identifier: {value}"
+                )
+
+            return engine.dialect.identifier_preparer.quote(value)
+
+        def quote_table(table_name):
+
+            parts = str(table_name).strip().split(".")
+
+            if len(parts) != 2:
+                raise ValueError(
+                    f"Table must use db_name.table_name: {table_name}"
+                )
+
+            return ".".join(
+                quote_identifier(part) for part in parts
+            )
+
+        # -------------------------------------------------
+        # 6. Compare values
+        # -------------------------------------------------
+
+        def values_match(source_value, target_value, column):
+
+            if pd.isna(source_value) and pd.isna(target_value):
+                return True
+
+            if pd.isna(source_value) or pd.isna(target_value):
+                return False
+
+            if column in amount_columns:
+
+                source_number = pd.to_numeric(
+                    pd.Series([source_value]), errors="coerce"
+                ).iloc[0]
+
+                target_number = pd.to_numeric(
+                    pd.Series([target_value]), errors="coerce"
+                ).iloc[0]
+
+                if pd.isna(source_number) or pd.isna(target_number):
+                    return False
+
+                return (
+                    abs(float(source_number) - float(target_number))
+                    <= tolerance
+                )
+
+            return source_value == target_value
+
+        # -------------------------------------------------
+        # 7. Process each configured target table
+        # -------------------------------------------------
+
+        for (target_table, join_column), table_mappings in mappings.groupby(
+            ["target_table", "join_column"],
+            sort=False
+        ):
+
+            target_table = str(target_table).strip()
+            join_column = str(join_column).strip()
+
+            table_sql = quote_table(target_table)
+            join_sql = quote_identifier(join_column)
+
+            source_columns = table_mappings[
+                "source_column"
+            ].astype(str).str.strip().tolist()
+
+            target_columns = table_mappings[
+                "target_column"
+            ].astype(str).str.strip().tolist()
+
+            if join_column not in df.columns:
+                raise ValueError(
+                    f"Join column '{join_column}' missing in input Excel"
+                )
+
+            for column in source_columns:
+                if column not in df.columns:
+                    raise ValueError(
+                        f"Source column '{column}' missing in input Excel"
+                    )
+
+            if len(set(target_columns)) != len(target_columns):
+                raise ValueError(
+                    f"Duplicate target column mapping for {target_table}"
+                )
+
+            select_columns = list(dict.fromkeys(
+                [join_column] + target_columns
+            ))
+
+            select_sql = ", ".join(
+                quote_identifier(col) for col in select_columns
+            )
+
+            # Fetch only the required seq_no records in batches
+            source_data = []
+
+            for start in range(0, len(seq_keys), self.BATCH_SIZE):
+
+                batch_keys = seq_keys[
+                    start:start + self.BATCH_SIZE
+                ]
+
+                placeholders = ", ".join(
+                    f":key_{i}" for i in range(len(batch_keys))
+                )
+
+                query = text(f"""
+                    SELECT {select_sql}
+                    FROM {table_sql}
+                    WHERE {join_sql} IN ({placeholders})
+                """)
+
+                params = {
+                    f"key_{i}": value
+                    for i, value in enumerate(batch_keys)
+                }
+
+                with engine.connect() as connection:
+                    batch_data = pd.read_sql(
+                        query,
+                        connection,
+                        params=params
+                    )
+
+                source_data.append(batch_data)
+
+            if source_data:
+                source_df = pd.concat(
+                    source_data,
+                    ignore_index=True
+                )
+            else:
+                source_df = pd.DataFrame(columns=select_columns)
+
+            # -------------------------------------------------
+            # 8. Group source rows by join key
+            # -------------------------------------------------
+
+            source_groups = {
+                key: group
+                for key, group in source_df.groupby(
+                    join_column,
+                    dropna=True,
+                    sort=False
+                )
+            }
+
+            # -------------------------------------------------
+            # 9. Compare complete rows, including duplicates
+            # -------------------------------------------------
+
+            failed_indices = []
+            reject_reasons = []
+
+            for key, input_group in df.groupby(
+                join_column,
+                dropna=False,
+                sort=False
+            ):
+
+                if pd.isna(key):
+                    failed_indices.extend(input_group.index.tolist())
+                    reject_reasons.extend(
+                        ["Missing join key"] * len(input_group)
+                    )
+                    continue
+
+                target_group = source_groups.get(key)
+
+                if target_group is None or target_group.empty:
+
+                    failed_indices.extend(input_group.index.tolist())
+                    reject_reasons.extend(
+                        ["Target record not found"] * len(input_group)
+                    )
+                    continue
+
+                # Create one row signature for each source record.
+                # Counter preserves duplicate row counts.
+                target_signatures = []
+
+                for _, target_row in target_group.iterrows():
+
+                    signature = tuple(
+                        target_row[col] for col in target_columns
+                    )
+
+                    target_signatures.append(signature)
+
+                unmatched_target_rows = list(target_signatures)
+
+                for input_index, input_row in input_group.iterrows():
+
+                    matched_position = None
+
+                    for position, target_signature in enumerate(
+                        unmatched_target_rows
+                    ):
+
+                        matched = all(
+                            values_match(
+                                input_row[source_col],
+                                target_value,
+                                source_col
+                            )
+                            for source_col, target_value in zip(
+                                source_columns,
+                                target_signature
+                            )
+                        )
+
+                        if matched:
+                            matched_position = position
+                            break
+
+                    if matched_position is not None:
+
+                        # Consume the matching source row.
+                        # This ensures duplicate records are counted.
+                        unmatched_target_rows.pop(matched_position)
+
+                    else:
+
+                        failed_indices.append(input_index)
+                        reject_reasons.append(
+                            "Source record mismatch or missing record"
+                        )
+
+            # -------------------------------------------------
+            # 10. Prepare DQ result
+            # -------------------------------------------------
+
+            failed_df = df.loc[failed_indices].copy()
+
+            if not failed_df.empty:
+
+                failed_df["reject_reason"] = reject_reasons
+                failed_df["target_table"] = target_table
+
+            failed_count = len(failed_df)
+
+            status = "PASS" if failed_count == 0 else "FAIL"
+
+            results.append({
+                "column": ", ".join(source_columns),
+                "status": status,
+                "failed_count": failed_count,
+                "failed_df": failed_df
+            })
+
+        return results
