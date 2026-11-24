@@ -1,0 +1,509 @@
+
+import re
+import math
+from decimal import Decimal, InvalidOperation
+from datetime import date, datetime
+from numbers import Number
+
+import pandas as pd
+from sqlalchemy import text
+
+from src.checks.base_check import BaseCheck
+from src.connection_manager import get_engine
+
+
+class AnomalyReconciliationCheck(BaseCheck):
+
+    BATCH_SIZE = 1000
+
+    def execute(self, df, config):
+
+        results = []
+
+        # -------------------------------------------------
+        # 1. Read metadata configuration
+        # -------------------------------------------------
+
+        config_file = config.get("config_file_path")
+
+        if not config_file:
+            raise ValueError("config_file_path is missing")
+
+        tolerance = Decimal(
+            str(config.get("amount_tolerance") or 0)
+        )
+
+        amount_columns = config.get("amount_columns") or []
+
+        if isinstance(amount_columns, str):
+            amount_columns = [
+                col.strip()
+                for col in amount_columns.split(",")
+                if col.strip()
+            ]
+
+        amount_columns = set(amount_columns)
+
+        # -------------------------------------------------
+        # 2. Read configuration Excel
+        # -------------------------------------------------
+
+        mappings = pd.read_excel(config_file)
+
+        required_columns = [
+            "source_column",
+            "target_column",
+            "target_table",
+            "join_column",
+            "active_flag"
+        ]
+
+        missing_columns = [
+            col for col in required_columns
+            if col not in mappings.columns
+        ]
+
+        if missing_columns:
+            raise ValueError(
+                f"Missing configuration columns: {missing_columns}"
+            )
+
+        mappings = mappings[
+            mappings["active_flag"].astype(str).str.strip().str.lower()
+            .isin(["1", "true", "yes", "y"])
+        ].copy()
+
+        if mappings.empty:
+            raise ValueError("No active reconciliation mappings found")
+
+        # Clean configuration values
+        for column in required_columns:
+            if column != "active_flag":
+                mappings[column] = (
+                    mappings[column].astype(str).str.strip()
+                )
+
+        # -------------------------------------------------
+        # 3. Validate input data
+        # -------------------------------------------------
+
+        df = df.reset_index(drop=True)
+
+        # -------------------------------------------------
+        # 4. Database connection and identifier validation
+        # -------------------------------------------------
+
+        engine = get_engine()
+
+        identifier_pattern = re.compile(r"^[A-Za-z0-9_]+$")
+
+        def quote_identifier(value):
+
+            value = str(value).strip()
+
+            if not identifier_pattern.fullmatch(value):
+                raise ValueError(
+                    f"Invalid SQL identifier: {value}"
+                )
+
+            return engine.dialect.identifier_preparer.quote(value)
+
+        def quote_table(table_name):
+
+            parts = str(table_name).split(".")
+
+            if len(parts) != 2:
+                raise ValueError(
+                    f"Invalid table name: {table_name}. "
+                    "Expected db_name.table_name"
+                )
+
+            return ".".join(
+                quote_identifier(part) for part in parts
+            )
+
+        # -------------------------------------------------
+        # 5. Normalize join keys
+        # -------------------------------------------------
+
+        def normalize_join_key(value):
+
+            if pd.isna(value):
+                return None
+
+            if isinstance(value, str):
+
+                value = value.strip()
+
+                # Normalize strings such as 123.0
+                if re.fullmatch(r"-?(0|[1-9][0-9]*)\.0+", value):
+                    return value.split(".")[0]
+
+                return value
+
+            if isinstance(value, Number):
+
+                number = Decimal(str(value))
+
+                if number == number.to_integral_value():
+                    return str(int(number))
+
+                return str(number.normalize())
+
+            return str(value).strip()
+
+        # -------------------------------------------------
+        # 6. NULL handling
+        # -------------------------------------------------
+
+        def is_null(value):
+
+            if pd.isna(value):
+                return True
+
+            if isinstance(value, str):
+                return value.strip().lower() in (
+                    "", "null", "none", "nan", "nat"
+                )
+
+            return False
+
+        # -------------------------------------------------
+        # 7. Compare values
+        # -------------------------------------------------
+
+        def values_match(source_value, target_value, column):
+
+            source_null = is_null(source_value)
+            target_null = is_null(target_value)
+
+            # Both NULL
+            if source_null and target_null:
+                return True
+
+            # Only one NULL
+            if source_null or target_null:
+                return False
+
+            # Amount comparison
+            if column in amount_columns:
+
+                try:
+                    source_number = Decimal(str(source_value))
+                    target_number = Decimal(str(target_value))
+
+                    return (
+                        abs(source_number - target_number)
+                        <= tolerance
+                    )
+
+                except (InvalidOperation, ValueError, TypeError):
+                    return False
+
+            # Numeric comparison:
+            # Handles Excel float versus MySQL Decimal
+            if (
+                isinstance(source_value, (Number, Decimal))
+                and not isinstance(source_value, bool)
+                and isinstance(target_value, (Number, Decimal))
+                and not isinstance(target_value, bool)
+            ):
+
+                return Decimal(str(source_value)) == Decimal(
+                    str(target_value)
+                )
+
+            # Date comparison
+            if isinstance(
+                source_value, (date, datetime, pd.Timestamp)
+            ) or isinstance(
+                target_value, (date, datetime, pd.Timestamp)
+            ):
+
+                try:
+                    source_date = pd.Timestamp(source_value)
+                    target_date = pd.Timestamp(target_value)
+
+                    return source_date == target_date
+
+                except (ValueError, TypeError):
+                    return False
+
+            # Normal exact comparison
+            return source_value == target_value
+
+        # -------------------------------------------------
+        # 8. Process each configured target table
+        # -------------------------------------------------
+
+        for (target_table, join_column), table_mappings in mappings.groupby(
+            ["target_table", "join_column"],
+            sort=False
+        ):
+
+            target_table = str(target_table).strip()
+            join_column = str(join_column).strip()
+
+            if join_column not in df.columns:
+                raise ValueError(
+                    f"Join column '{join_column}' missing in input Excel"
+                )
+
+            source_columns = table_mappings[
+                "source_column"
+            ].tolist()
+
+            target_columns = table_mappings[
+                "target_column"
+            ].tolist()
+
+            for column in source_columns:
+
+                if column not in df.columns:
+                    raise ValueError(
+                        f"Input column '{column}' not found"
+                    )
+
+            if len(set(source_columns)) != len(source_columns):
+                raise ValueError(
+                    f"Duplicate source column mapping in {target_table}"
+                )
+
+            if len(set(target_columns)) != len(target_columns):
+                raise ValueError(
+                    f"Duplicate target column mapping in {target_table}"
+                )
+
+            # -------------------------------------------------
+            # 9. Get DISTINCT join keys for this table
+            # -------------------------------------------------
+
+            input_keys = (
+                df[join_column]
+                .dropna()
+                .drop_duplicates()
+                .tolist()
+            )
+
+            if not input_keys:
+                raise ValueError(
+                    f"No valid keys found for {join_column}"
+                )
+
+            # -------------------------------------------------
+            # 10. Fetch only matching source records
+            # -------------------------------------------------
+
+            table_sql = quote_table(target_table)
+
+            select_columns = list(dict.fromkeys(
+                [join_column] + target_columns
+            ))
+
+            select_sql = ", ".join(
+                quote_identifier(col) for col in select_columns
+            )
+
+            join_sql = quote_identifier(join_column)
+
+            source_batches = []
+
+            for start in range(0, len(input_keys), self.BATCH_SIZE):
+
+                batch_keys = input_keys[
+                    start:start + self.BATCH_SIZE
+                ]
+
+                placeholders = ", ".join(
+                    f":key_{i}" for i in range(len(batch_keys))
+                )
+
+                query = text(f"""
+                    SELECT {select_sql}
+                    FROM {table_sql}
+                    WHERE {join_sql} IN ({placeholders})
+                """)
+
+                params = {
+                    f"key_{i}": value
+                    for i, value in enumerate(batch_keys)
+                }
+
+                with engine.connect() as connection:
+
+                    batch_df = pd.read_sql(
+                        query,
+                        connection,
+                        params=params
+                    )
+
+                source_batches.append(batch_df)
+
+            if source_batches:
+
+                source_df = pd.concat(
+                    source_batches,
+                    ignore_index=True
+                )
+
+            else:
+
+                source_df = pd.DataFrame(
+                    columns=select_columns
+                )
+
+            # -------------------------------------------------
+            # 11. Normalize keys on both DataFrames
+            # -------------------------------------------------
+
+            input_df = df.copy()
+
+            input_df["_normalized_key"] = (
+                input_df[join_column].apply(normalize_join_key)
+            )
+
+            source_df["_normalized_key"] = (
+                source_df[join_column].apply(normalize_join_key)
+            )
+
+            source_groups = {
+                key: group
+                for key, group in source_df.groupby(
+                    "_normalized_key",
+                    dropna=True,
+                    sort=False
+                )
+            }
+
+            # -------------------------------------------------
+            # 12. Compare records, including duplicate rows
+            # -------------------------------------------------
+
+            failed_indices = []
+            reject_reasons = []
+
+            for key, input_group in input_df.groupby(
+                "_normalized_key",
+                dropna=False,
+                sort=False
+            ):
+
+                if key is None or pd.isna(key):
+
+                    failed_indices.extend(input_group.index.tolist())
+
+                    reject_reasons.extend(
+                        ["Missing join key"] * len(input_group)
+                    )
+
+                    continue
+
+                target_group = source_groups.get(key)
+
+                if target_group is None or target_group.empty:
+
+                    failed_indices.extend(input_group.index.tolist())
+
+                    reject_reasons.extend(
+                        ["Target record not found"] * len(input_group)
+                    )
+
+                    continue
+
+                # Keep source rows available for one-to-one matching
+                unmatched_target_rows = [
+                    row
+                    for _, row in target_group.iterrows()
+                ]
+
+                for input_index, input_row in input_group.iterrows():
+
+                    matched_position = None
+                    best_mismatches = None
+
+                    # Find the closest matching source row
+                    for position, target_row in enumerate(
+                        unmatched_target_rows
+                    ):
+
+                        mismatches = []
+
+                        for source_col, target_col in zip(
+                            source_columns,
+                            target_columns
+                        ):
+
+                            excel_value = input_row[source_col]
+                            mysql_value = target_row[target_col]
+
+                            if not values_match(
+                                excel_value,
+                                mysql_value,
+                                source_col
+                            ):
+
+                                mismatches.append(
+                                    f"{source_col}: "
+                                    f"Excel={excel_value!r}, "
+                                    f"Source={mysql_value!r}"
+                                )
+
+                        if not mismatches:
+
+                            matched_position = position
+                            break
+
+                        if (
+                            best_mismatches is None
+                            or len(mismatches) < len(best_mismatches)
+                        ):
+
+                            best_mismatches = mismatches
+
+                    if matched_position is not None:
+
+                        # Consume the matched source row
+                        unmatched_target_rows.pop(matched_position)
+
+                    else:
+
+                        failed_indices.append(input_index)
+
+                        if best_mismatches:
+
+                            reason = (
+                                "Value mismatch: "
+                                + " | ".join(best_mismatches)
+                            )
+
+                        else:
+
+                            reason = "No matching source record found"
+
+                        reject_reasons.append(reason)
+
+            # -------------------------------------------------
+            # 13. Prepare DQ results
+            # -------------------------------------------------
+
+            failed_df = df.loc[failed_indices].copy()
+
+            if not failed_df.empty:
+
+                failed_df["reject_reason"] = reject_reasons
+                failed_df["target_table"] = target_table
+
+            failed_count = len(failed_df)
+
+            status = (
+                "PASS" if failed_count == 0 else "FAIL"
+            )
+
+            results.append({
+                "column": ", ".join(source_columns),
+                "status": status,
+                "failed_count": failed_count,
+                "failed_df": failed_df
+            })
+
+        return results
